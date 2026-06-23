@@ -14,10 +14,10 @@ A Linux game launcher for Native, Proton, GOG, and Steam games. Built with Pytho
 - **Cover art** — automatic fetching from SteamGridDB and VNDB
 - **Import** — import games from Steam, Heroic, and Lutris libraries
 - **Extended GOG support** — breadcrumb-based install detection, Heroic and Lutris GOG import
-- **Extended Visual Novel support** — Japanese and Western VNs, VNDB cover search, dedicated VN game type
-- **AI upscaling** — per-game AI upscale toggle with model selection (for Visual Novels)
+- **Extended Visual Novel support** — Japanese and Western VNs, VNDB cover search
+- **AI upscaling** — per-game AI upscale toggle with model selection, powered by [linux-rt-upscaler](https://github.com/baronsmv/linux-rt-upscaler)
 - **Per-game Wine prefixes** — each game gets its own isolated prefix
-- **Save backups** — ludusavi integration for backup and restore
+- **Save backups** — [ludusavi](https://github.com/mtkennerly/ludusavi) integration for backup and restore
 - **In-game upscaler detection** — detects FSR 4, FSR 3.1, FSR 2, DLSS, and XeSS DLLs in game directories
 - **Proton management** — auto-detects all installed Proton versions (GE-Proton, CachyOS Proton, Steam Proton, system-installed)
 - **umu-launcher integration** — all Proton/GOG games run through umu unconditionally; auto-installs on first run
