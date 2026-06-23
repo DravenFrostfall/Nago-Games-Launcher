@@ -1,6 +1,6 @@
 # NAGO Launcher
 
-Smooth to use, good looking GUI, light and compact, and above all, works without any issues.
+Smooth to use, good looking GUI, light and compact Linux Games-Launcher.
 
 A Linux game launcher for Native, Proton, GOG, and Steam games. Built with Python and PyQt6. In active development.
 
@@ -35,9 +35,9 @@ A Linux game launcher for Native, Proton, GOG, and Steam games. Built with Pytho
 
 ## Screenshots
 
-<img src="screenshots/MAIN-Screenshot_20260623_220227.png" width="800"/>
-
 *Main library view*
+
+<img src="screenshots/MAIN-Screenshot_20260623_220227.png" width="800"/>
 
 <img src="screenshots/Screenshot_20260623_214649.png" width="800"/>
 
