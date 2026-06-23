@@ -4,7 +4,7 @@ Smooth to use, good looking GUI, light and compact, and above all, works without
 
 A Linux game launcher for Native, Proton, GOG, and Steam games. Built with Python and PyQt6. In active development.
 
-![NAGO Launcher](icons/nago-logo.png)
+<p align="center"><img src="icons/2nago-logo.png" width="200"/></p>
 
 ---
 
