@@ -115,7 +115,7 @@ sys.excepthook = _safe_excepthook
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME = "NAGO"
 VERSION  = "1.0.0"
-BUILD    = "23-06-2026 23:11"
+BUILD    = "27-06-2026 00:35"
 
 # Locale-safe date helpers — always English month abbreviations regardless of system locale.
 _MONTH_ABBR = ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
@@ -2823,18 +2823,23 @@ def ludusavi_roots_for_game(game: dict) -> list[dict]:
         # store=other on the library parent covers install-folder saves.
         # Unlike store=gog, it fires no store-specific manifest conditions,
         # so it works for all game types without false store assumptions.
-        # The library parent is exe_path.parent for most games; for GOG games
-        # _find_install_dir walks up to find the goggame-*.info root first.
+        # Prefer install_dir from DB (user-confirmed ground truth); fall back to
+        # _find_install_dir heuristic only when the DB value is absent.
+        db_install_dir = (game.get("install_dir") or "").strip()
         exe = (game.get("exe_path") or "").strip()
-        if exe:
-            try:
+        try:
+            if db_install_dir and Path(db_install_dir).is_dir():
+                install_dir = db_install_dir
+            elif exe:
                 install_dir = _find_install_dir(exe)
-                if install_dir:
-                    library = str(Path(install_dir).parent)
-                    if library and library not in {r["path"] for r in roots}:
-                        roots.append({"store": "other", "path": library})
-            except Exception:
-                pass
+            else:
+                install_dir = ""
+            if install_dir:
+                library = str(Path(install_dir).parent)
+                if library and library not in {r["path"] for r in roots}:
+                    roots.append({"store": "other", "path": library})
+        except Exception:
+            pass
 
         return roots
 
@@ -2879,8 +2884,11 @@ def _find_install_dir(exe_path: str) -> str:
             break
         current = current.parent
 
-    # Fallback: exe's immediate parent directory.
-    return str(Path(exe_path).parent)
+    # Fallback: use _game_scan_root structural strip (strips known binary
+    # subdirs like bin/win64/windows/x64) for a more accurate install root.
+    # Falls back to exe.parent if _game_scan_root returns None.
+    _scan = _game_scan_root(exe_path)
+    return str(_scan) if _scan is not None else str(Path(exe_path).parent)
 
 
 def _game_scan_root(exe_path: str) -> "Path | None":
@@ -3733,6 +3741,12 @@ class LudusaviFindWorker(_NAGOThread):
             if isinstance(entry, dict):
                 all_paths.extend((entry.get("files") or {}).keys())
         if not all_paths:
+            # Preview returned nothing — likely because the prefix doesn't exist
+            # yet (game never launched) so the otherWine root is missing and
+            # ludusavi can't resolve in-prefix saves. If install_dir exists we
+            # can't rule the title invalid, so treat as unverifiable → True.
+            if install_dir and Path(install_dir).is_dir():
+                return True
             return False
         # Build the territory list from what we know about this game.
         territories = []
@@ -6430,15 +6444,40 @@ def init_db():
     """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS playtime_archive (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            exe_filename    TEXT NOT NULL,
-            game_type       TEXT NOT NULL,
-            store_key       TEXT DEFAULT '',
-            game_name       TEXT NOT NULL,
-            playtime_minutes INTEGER DEFAULT 0,
-            last_played     TEXT DEFAULT '',
-            archived_at     TEXT NOT NULL,
-            prefix_path     TEXT DEFAULT ''
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            exe_filename         TEXT NOT NULL,
+            game_type            TEXT NOT NULL,
+            store_key            TEXT DEFAULT '',
+            game_name            TEXT NOT NULL,
+            playtime_minutes     INTEGER DEFAULT 0,
+            last_session_minutes INTEGER DEFAULT 0,
+            last_played          TEXT DEFAULT '',
+            archived_at          TEXT NOT NULL,
+            prefix_path          TEXT DEFAULT '',
+            -- per-game config fields
+            launch_args          TEXT DEFAULT '',
+            env_vars             TEXT DEFAULT '',
+            pre_launch_cmd       TEXT DEFAULT '',
+            post_exit_cmd        TEXT DEFAULT '',
+            auto_backup          INTEGER DEFAULT 0,
+            ludusavi_title       TEXT DEFAULT '',
+            gamescope_enabled    INTEGER DEFAULT 0,
+            upscale_enabled      INTEGER DEFAULT 0,
+            upscale_model        TEXT DEFAULT 'fast',
+            hdr_enabled          INTEGER DEFAULT 0,
+            fsr4_upgrade         TEXT DEFAULT '',
+            optiscaler_dll       TEXT DEFAULT '',
+            use_wined3d          INTEGER DEFAULT 0,
+            use_wow64            INTEGER DEFAULT 0,
+            use_wayland          INTEGER DEFAULT 0,
+            no_esync             INTEGER DEFAULT 0,
+            no_fsync             INTEGER DEFAULT 0,
+            no_ntsync            INTEGER DEFAULT 0,
+            legacy_mediaconv     INTEGER DEFAULT 0,
+            video_decode_mode    TEXT DEFAULT 'default',
+            vn_jp_locale         INTEGER DEFAULT 0,
+            added_at             TEXT DEFAULT '',
+            category_names       TEXT DEFAULT ''
         )
     """)
     # Migrate playtime_archive to add prefix_path if missing
@@ -6446,6 +6485,36 @@ def init_db():
     pa_cols = {row[1] for row in cur.fetchall()}
     if "prefix_path" not in pa_cols:
         con.execute("ALTER TABLE playtime_archive ADD COLUMN prefix_path TEXT DEFAULT ''")
+    if "last_session_minutes" not in pa_cols:
+        con.execute("ALTER TABLE playtime_archive ADD COLUMN last_session_minutes INTEGER DEFAULT 0")
+    # Config archive columns — added as a batch; each guarded individually for safety
+    for _pac, _padef in [
+        ("launch_args",       "TEXT DEFAULT ''"),
+        ("env_vars",          "TEXT DEFAULT ''"),
+        ("pre_launch_cmd",    "TEXT DEFAULT ''"),
+        ("post_exit_cmd",     "TEXT DEFAULT ''"),
+        ("auto_backup",       "INTEGER DEFAULT 0"),
+        ("ludusavi_title",    "TEXT DEFAULT ''"),
+        ("gamescope_enabled", "INTEGER DEFAULT 0"),
+        ("upscale_enabled",   "INTEGER DEFAULT 0"),
+        ("upscale_model",     "TEXT DEFAULT 'fast'"),
+        ("hdr_enabled",       "INTEGER DEFAULT 0"),
+        ("fsr4_upgrade",      "TEXT DEFAULT ''"),
+        ("optiscaler_dll",    "TEXT DEFAULT ''"),
+        ("use_wined3d",       "INTEGER DEFAULT 0"),
+        ("use_wow64",         "INTEGER DEFAULT 0"),
+        ("use_wayland",       "INTEGER DEFAULT 0"),
+        ("no_esync",          "INTEGER DEFAULT 0"),
+        ("no_fsync",          "INTEGER DEFAULT 0"),
+        ("no_ntsync",         "INTEGER DEFAULT 0"),
+        ("legacy_mediaconv",  "INTEGER DEFAULT 0"),
+        ("video_decode_mode", "TEXT DEFAULT 'default'"),
+        ("vn_jp_locale",      "INTEGER DEFAULT 0"),
+        ("added_at",           "TEXT DEFAULT ''"),
+        ("category_names",     "TEXT DEFAULT ''"),
+    ]:
+        if _pac not in pa_cols:
+            con.execute(f"ALTER TABLE playtime_archive ADD COLUMN {_pac} {_padef}")
     # Migrate games to add prefix_path override if missing
     cur = con.execute("PRAGMA table_info(games)")
     existing_cols = {row[1] for row in cur.fetchall()}
@@ -6792,7 +6861,7 @@ class SGDBWorker(_NAGOThread):
                 if data.get("success"):
                     self.results_ready.emit(data.get("data", []))
                 else:
-                    self.error.emit(data.get("errors", ["Unknown error"])[0])
+                    self.error.emit((data.get("errors") or ["Unknown error"])[0])
 
             elif self._mode == "covers":
                 r = _requests().get(
@@ -6825,6 +6894,9 @@ class SGDBWorker(_NAGOThread):
             elif self._mode == "download":
                 r = _requests().get(self._cover_url, timeout=30)
                 r.raise_for_status()
+                if not r.content:
+                    self.error.emit("Cover download failed — server returned an empty file.")
+                    return
                 img = _pil_image().open(io.BytesIO(r.content)).convert("RGBA")
                 slug = self._slugify(self._game_name)
                 # Suffix with the game id so covers stay unique even if two games share a name
@@ -6839,6 +6911,7 @@ class SGDBWorker(_NAGOThread):
 
 # ── Cover thumbnail loader ─────────────────────────────────────────────────────
 class ThumbnailWorker(_NAGOThread):
+    _log_lifecycle = False  # spawns frequently during library load — too noisy
     loaded = pyqtSignal(int, QPixmap)   # game_id, pixmap
 
     def __init__(self, tasks: list):    # [(game_id, path)]
@@ -7315,6 +7388,18 @@ class _CardHoverOverlay(QWidget):
         event.ignore()
 
     def mousePressEvent(self, event):
+        # Right-click: set the context-menu-open flag on the parent card so
+        # paintEvent draws the tint immediately, then ignore so the event
+        # propagates to GameCard.contextMenuEvent.
+        if event.button() == Qt.MouseButton.RightButton:
+            card = self.parent()
+            if card is not None:
+                card._context_menu_open = True
+                self.show()
+                self.setWindowOpacity(1.0)
+                self.repaint()   # synchronous — must flush before exec() blocks
+            event.ignore()
+            return
         # Accept press inside the circle to prevent it falling through to drag,
         # but don't launch yet — wait for release.
         if event.button() == Qt.MouseButton.LeftButton and not self._is_running and self._play_visible:
@@ -7344,11 +7429,22 @@ class _CardHoverOverlay(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setClipRect(self.rect())
 
+        # ── Context-menu tint + boosted outline ─────────────────────────────
+        card = self.parent()
+        ctx_open = getattr(card, "_context_menu_open", False)
+        if ctx_open:
+            accent_tint = QColor(self._accent_color)
+            accent_tint.setAlpha(50)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(accent_tint))
+            p.drawRoundedRect(self.rect(), CARD_RADIUS, CARD_RADIUS)
+
         # ── Accent outline ────────────────────────────────────────────────
-        # Pen is 3px, drawn centered on the rect edge — inset by 1.5px (round to 1)
-        # so the stroke sits just inside the card border. Radius reduced by 1
-        # to match the visual corner of the card at the inset position.
-        pen = QPen(QColor(self._accent_color), 3)
+        # Pen is 3px normally; boosted to 5px while context menu is open.
+        # Drawn centered on the rect edge — inset by 1px so stroke sits just
+        # inside the card border. Radius reduced by 1 to match the visual corner.
+        outline_w = 5 if ctx_open else 3
+        pen = QPen(QColor(self._accent_color), outline_w)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -7451,6 +7547,11 @@ class GameCard(QFrame):
         # Updated live via update_play_button() when settings change.
         self._play_button_enabled = bool(load_config().get("show_play_button", True))
 
+        # True while the right-click context menu is open — used by the hover
+        # overlay to hold the accent outline + tint even though leaveEvent fires
+        # when the menu takes focus.
+        self._context_menu_open = False
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         w = self.width()
@@ -7483,7 +7584,10 @@ class GameCard(QFrame):
     def leaveEvent(self, event):
         self._hover_timer.stop()
         self._hover_overlay.set_play_visible(False)
-        self._hover_overlay.fade_out()
+        # Do not hide the overlay while the context menu is open — the menu
+        # opening causes Qt to send leaveEvent which would kill the tint.
+        if not self._context_menu_open:
+            self._hover_overlay.fade_out()
         super().leaveEvent(event)
 
     def _build(self):
@@ -7972,7 +8076,28 @@ class GameCard(QFrame):
                 del_pfx_act, del_pfx_row = _make_menu_row(menu, "x", "Delete Prefix", disabled=_running)
                 menu.addAction(del_pfx_act)
 
+        # Show accent outline + tint while the menu is open.
+        # Two entry paths:
+        # 1) Overlay was visible (hover) — overlay.mousePressEvent already set
+        #    the flag and called update(); nothing more needed here.
+        # 2) Overlay was hidden (no prior hover) — right-click went straight to
+        #    GameCard, so we must show/update the overlay ourselves.
+        if not self._context_menu_open:
+            self._context_menu_open = True
+            self._hover_overlay.show()
+            self._hover_overlay.setWindowOpacity(1.0)
+            self._hover_overlay.repaint()   # repaint() flushes synchronously before exec()
+
         action = menu.exec(event.globalPos())
+
+        self._context_menu_open = False
+        # If the cursor is still over the card, enterEvent won't re-fire —
+        # restore the hover state manually; otherwise hide the overlay.
+        if self.underMouse():
+            self._hover_overlay.fade_in()
+        else:
+            self._hover_overlay.fade_out()
+
         if action == launch_act and not _running:
             self.launch_requested.emit(self.game)
         elif force_term_act and action == force_term_act:
@@ -10517,9 +10642,9 @@ class GameDialog(_NAGODialog):
         self._fsr4_cb = NAGOCheckBox("FSR4 Upgrade")
         self._fsr4_cb.setChecked(bool(_saved_fsr4))
         self._fsr4_cb.setToolTip(
-            "Replaces the game's bundled FSR 3.1 DLL with a newer FSR 4 version.\n"
-            "Works on GE-Proton and Proton-CachyOS.\n"
-            "Only applies to games that ship FSR 3.1 — older FSR versions are not upgraded."
+            "Upgrades FSR 3.1+ games to FSR 4. No effect on FSR 1/2.\n"
+            "May break games with native FSR 4 — disable if stutters occur.\n"
+            "Requires GE-Proton or Proton-CachyOS."
         )
         _iu_row.addWidget(self._fsr4_cb)
 
@@ -10670,6 +10795,16 @@ class GameDialog(_NAGODialog):
 
         # ── Footer: Cancel / Save Game ─────────────────────────────────────
         footer_row = QHBoxLayout()
+        # "Added on" label — Edit Game only, left-aligned, muted
+        if self.game and self.game.get("added_at"):
+            try:
+                _added_dt = datetime.datetime.fromisoformat(self.game["added_at"])
+                _added_str = _added_dt.strftime("%d %b %Y")
+            except Exception:
+                _added_str = self.game["added_at"]
+            _added_lbl = QLabel(f"Added  {_added_str}")
+            _added_lbl.setObjectName("fieldHint")
+            footer_row.addWidget(_added_lbl)
         footer_row.addStretch()
         cancel_btn = QPushButton("  Cancel")
         cancel_btn.setIcon(ph_icon("x", 22))
@@ -11035,6 +11170,10 @@ class GameDialog(_NAGODialog):
         good = [r for r in results
                 if r.get("processedGames", 0) >= 1 and r.get("fileCount", 0) >= 1]
         if not good:
+            _NAGOLog.session(
+                f"[ludusavi][backup] no saves found for '{self.game.get('name', '')}'  "
+                f"titles tried: {[r.get('resolvedTitle', '') for r in results]}"
+            )
             self._refresh_backup_card()
             self._bk_status.setText(
                 "No saves found — try Back up again and pick a different match"
@@ -11063,6 +11202,13 @@ class GameDialog(_NAGODialog):
             _summary = f"{len(good)} titles, {total_files} file(s) ({total_mb:.1f} MB)"
         self._bk_db_write(last_backup=stamp, backup_location="",
                           title=_cache_title, backup_summary=_summary)
+        _bk_root = getattr(self._bk_worker, "_backup_root", "") if self._bk_worker else ""
+        _NAGOLog.session(
+            f"[ludusavi][backup] success  game='{self.game.get('name', '')}'  "
+            f"title='{primary.get('resolvedTitle', '')}'  "
+            f"files={total_files}  size={total_mb:.2f} MB  "
+            f"path='{_bk_root or '(default)'}'"
+        )
         if _cache_title:
             _NAGOLog.session(f"[ludusavi][backup] cached title for shortcut: '{_cache_title}'")
         self._refresh_backup_card()
@@ -11136,9 +11282,15 @@ class GameDialog(_NAGODialog):
 
     def _on_find_failed(self, msg: str):
         # find returned nothing -- show the manual picker with an empty combo.
+        _NAGOLog.session(
+            f"[ludusavi][find] failed for '{self.game.get('name', '')}'  reason: {msg}"
+        )
         self._on_find_candidates([])
 
     def _on_backup_failed(self, msg: str):
+        _NAGOLog.session(
+            f"[ludusavi][backup] failed for '{self.game.get('name', '')}'  reason: {msg}"
+        )
         self._refresh_backup_card()
         NAGOMessageBox.warning(self, "Backup Failed", msg)
 
@@ -11312,6 +11464,9 @@ class GameDialog(_NAGODialog):
         self._bk_status.show()
 
     def _on_restore_failed(self, msg: str):
+        _NAGOLog.session(
+            f"[ludusavi][restore] failed for '{self.game.get('name', '')}'  reason: {msg}"
+        )
         self._refresh_backup_card()
         NAGOMessageBox.warning(self, "Restore Failed", msg)
 
@@ -13219,9 +13374,25 @@ class GameDialog(_NAGODialog):
                     con.close()
             self._pending_cover_path = ""
 
-        # Stop any in-flight cover-download worker so it can't fire into the
-        # dialog after it closes.
-        self._teardown_cover_worker()
+        # If a cover download is still in flight, don't kill it — detach the
+        # dialog's slot and hand the live worker to _add_game via result_data
+        # so it can reconnect it once the new game ID is known.
+        # If no download is in flight, teardown as normal.
+        dw = self._dw
+        try:
+            still_running = dw is not None and dw.isRunning()
+        except RuntimeError:
+            # C++ object already deleted (worker finished and deleteLater fired)
+            still_running = False
+        if still_running:
+            try:
+                dw.cover_downloaded.disconnect(self._on_cover_downloaded)
+            except (TypeError, RuntimeError):
+                pass
+            self.result_data["cover_worker"] = dw
+            self._dw = None
+        else:
+            self._teardown_cover_worker()
         self.accept()
 
     def reject(self):
@@ -16044,9 +16215,12 @@ class LibraryPage(QWidget):
             def _on_done(summary: dict) -> None:
                 _write_auto_backup_db(gid, title, summary)
                 _set_pill("success")
+                _mb = summary.get("totalBytes", 0) / (1024 * 1024)
                 _NAGOLog.session(
-                    f"[auto-backup] success game {gid} title='{title}' "
-                    f"files={summary.get('fileCount', 0)}"
+                    f"[auto-backup] success  game {gid} '{game.get('name','')}'  "
+                    f"title='{title}'  "
+                    f"files={summary.get('fileCount', 0)}  size={_mb:.2f} MB  "
+                    f"path='{str(LUDUSAVI_AUTO_BACKUPS)}'"
                 )
                 _cleanup(bk_worker)
 
@@ -16474,15 +16648,43 @@ class LibraryPage(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             con = db_con()
-            row = con.execute("SELECT cover_path, name, exe_path, game_type, "
-                              "umu_store, playtime_minutes, last_played, prefix_path FROM games WHERE id=?",
-                              (gid,)).fetchone()
+            row = con.execute(
+                "SELECT cover_path, name, exe_path, game_type, umu_store, "
+                "playtime_minutes, last_session_minutes, last_played, prefix_path, gog_id, "
+                "launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, "
+                "ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, "
+                "hdr_enabled, fsr4_upgrade, optiscaler_dll, "
+                "use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, "
+                "legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at "
+                "FROM games WHERE id=?",
+                (gid,)).fetchone()
             # Always archive on delete — captures prefix path even if never played
             if row:
-                _name, _exe, _gtype, _store, _pt, _lp, _pfx_override = (
-                    row[1], row[2], row[3], row[4], row[5] or 0, row[6], row[7] or "")
+                _name, _exe, _gtype, _store, _pt, _ls, _lp, _pfx_override, _gog_id = (
+                    row[1], row[2], row[3], row[4], row[5] or 0, row[6] or 0, row[7], row[8] or "", row[9] or "")
+                # Config fields
+                (_launch_args, _env_vars, _pre_cmd, _post_cmd, _auto_backup,
+                 _ludusavi_title, _gamescope, _upscale, _upscale_model,
+                 _hdr, _fsr4, _optiscaler,
+                 _wined3d, _wow64, _wayland, _no_esync, _no_fsync, _no_ntsync,
+                 _legacy_mc, _video_decode, _vn_jp) = (
+                    row[10] or "", row[11] or "", row[12] or "", row[13] or "", row[14] or 0,
+                    row[15] or "", row[16] or 0, row[17] or 0, row[18] or "fast",
+                    row[19] or 0, row[20] or "", row[21] or "",
+                    row[22] or 0, row[23] or 0, row[24] or 0, row[25] or 0, row[26] or 0, row[27] or 0,
+                    row[28] or 0, row[29] or "default", row[30] or 0)
+                _added_at_orig = row[31] or ""
                 _exe_filename = Path(_exe).name if _exe else ""
-                _store_key = _store or ""
+                # store_key must be a unique identifier per game:
+                #   Steam  → AppID (exe_path); umu_store is just "steam", useless as key
+                #   GOG    → gog_id (numeric GOG game ID); umu_store is just "gog", same for all GOG games
+                #   Others → umu_store (may be empty for native/proton, keyed by exe_filename instead)
+                if _gtype == "steam":
+                    _store_key = _exe.strip() if _exe else ""
+                elif _gtype == "gog":
+                    _store_key = _gog_id.strip() if _gog_id else ""
+                else:
+                    _store_key = _store or ""
                 # Resolve the actual prefix path on disk — do NOT call get_game_prefix()
                 # because that function creates the directory as a side-effect, which
                 # would cause an empty folder to be archived and "restored" later.
@@ -16495,13 +16697,33 @@ class LibraryPage(QWidget):
                 # An empty/nonexistent path is useless to restore.
                 if not Path(_pfx_path).exists():
                     _pfx_path = ""
+                # Fetch category names for this game before deletion
+                _cat_rows = con.execute(
+                    "SELECT c.name FROM categories c "
+                    "JOIN game_categories gc ON gc.category_id = c.id "
+                    "WHERE gc.game_id=? ORDER BY c.name", (gid,)
+                ).fetchall()
+                _cat_names = ",".join(r[0] for r in _cat_rows) if _cat_rows else ""
+
                 if _exe_filename or _store_key:
                     con.execute("""
                         INSERT INTO playtime_archive
                             (exe_filename, game_type, store_key, game_name,
-                             playtime_minutes, last_played, archived_at, prefix_path)
-                        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)
-                    """, (_exe_filename, _gtype, _store_key, _name, _pt, _lp or "", _pfx_path))
+                             playtime_minutes, last_session_minutes, last_played, archived_at, prefix_path,
+                             launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup,
+                             ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model,
+                             hdr_enabled, fsr4_upgrade, optiscaler_dll,
+                             use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync,
+                             legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (_exe_filename, _gtype, _store_key, _name, _pt, _ls, _lp or "", _pfx_path,
+                          _launch_args, _env_vars, _pre_cmd, _post_cmd, _auto_backup,
+                          _ludusavi_title, _gamescope, _upscale, _upscale_model,
+                          _hdr, _fsr4, _optiscaler,
+                          _wined3d, _wow64, _wayland, _no_esync, _no_fsync, _no_ntsync,
+                          _legacy_mc, _video_decode, _vn_jp, _added_at_orig, _cat_names))
             con.execute("DELETE FROM games WHERE id=?", (gid,))
             con.commit()
             con.close()
@@ -18936,9 +19158,13 @@ class MainWindow(QMainWindow):
                 con.commit()
                 new_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
                 _NAGOLog.session(
-                    f'[add-game] "{d["name"]}"  '
-                    f'exe={d["exe_path"]}  '
-                    f'install_dir={d.get("install_dir", "") or "(none)"}'
+                    f'[add-game] "{d["name"]}"'
+                )
+                _NAGOLog.session(
+                    f'  exe={d["exe_path"]}'
+                )
+                _NAGOLog.session(
+                    f'  install_dir={d.get("install_dir", "") or "(none)"}'
                 )
 
                 # If a cover was picked before saving, rename it from _0 to _<real_id>
@@ -18952,6 +19178,39 @@ class MainWindow(QMainWindow):
                     con.execute("UPDATE games SET cover_path=? WHERE id=?",
                                 (str(final), new_id))
                     con.commit()
+
+                # If a cover download was still in flight when Save was pressed,
+                # reconnect the live worker to apply the cover once it finishes.
+                cover_worker = d.get("cover_worker")
+                if cover_worker is not None:
+                    _slug = slugify(d["name"])
+                    _nid  = new_id
+                    def _bg_cover_done(_gid_ignored: int, path: str,
+                                       slug=_slug, nid=_nid, wref=cover_worker):
+                        try:
+                            ART_PATH.mkdir(parents=True, exist_ok=True)
+                            ext   = Path(path).suffix or ".png"
+                            final = ART_PATH / f"{slug}_{nid}{ext}"
+                            if Path(path).exists() and Path(path) != final:
+                                Path(path).rename(final)
+                            _con = db_con()
+                            _con.execute("UPDATE games SET cover_path=? WHERE id=?",
+                                         (str(final), nid))
+                            _con.commit()
+                            _con.close()
+                            for g in self._all_games:
+                                if g["id"] == nid:
+                                    g["cover_path"] = str(final)
+                                    break
+                            self._refresh_single_cover(nid, str(final))
+                            self.status_message.emit("Cover saved!")
+                        except Exception as e:
+                            _NAGOLog.session(f"[warn] _add_game bg cover: {e}")
+                        finally:
+                            self._single_cover_workers.discard(wref)
+                    cover_worker.cover_downloaded.connect(_bg_cover_done)
+                    cover_worker.finished.connect(cover_worker.deleteLater)
+                    self._single_cover_workers.add(cover_worker)
 
                 # If a tmp prefix was created via Run in Prefix before saving,
                 # rename it to the canonical slug_id path and persist it.
@@ -18994,55 +19253,101 @@ class MainWindow(QMainWindow):
                 _store   = d.get("umu_store", "") or ""
                 _gname   = d["name"]
 
-                # Build the lookup key depending on game type
+                # Build the lookup key depending on game type.
+                # All types restore silently — playtime, last session, and last
+                # played are all restored. No prompt: removing and re-adding a
+                # game is unambiguous intent to restore its history.
                 if _gt == "steam":
-                    # Steam: key by store_key (AppID) — auto restore, no prompt
+                    # Steam: keyed by AppID (store_key) — silent full restore
                     arc = con.execute("""
-                        SELECT id, game_name, playtime_minutes, last_played
+                        SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
+                               launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
                         FROM playtime_archive
                         WHERE game_type='steam' AND store_key=?
                         ORDER BY archived_at DESC LIMIT 1
                     """, (_exe.strip(),)).fetchone()
-                    if arc and arc[2] > 0:
-                        con.execute("UPDATE games SET playtime_minutes=?, last_played=? WHERE id=?",
-                                    (arc[2], arc[3], new_id))
+                    if arc:
+                        con.execute(
+                            "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
+                            "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                            (arc[2], arc[3], arc[4],
+                             arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                             new_id))
                         con.commit()
-                        self._set_status(f"Restored {arc[2] // 60}h playtime for {_gname}")
+                        self._set_status(f"Restored playtime and settings for {_gname}")
+                        # Restore categories — match by name, skip any that no longer exist
+                        _arc_cats = (arc[27] or "").strip()
+                        if _arc_cats:
+                            _cat_names_to_restore = [c.strip() for c in _arc_cats.split(",") if c.strip()]
+                            if _cat_names_to_restore:
+                                _existing_cats = {c["name"]: c["id"] for c in db_get_categories()}
+                                _restore_ids = [_existing_cats[n] for n in _cat_names_to_restore if n in _existing_cats]
+                                if _restore_ids:
+                                    db_set_game_categories(new_id, _restore_ids)
 
                 elif _gt in ("gog",) or (_gt == "proton" and _store == "gog"):
-                    # GOG: key by store_key (GOG game ID parsed from info file) — auto restore
-                    arc = con.execute("""
-                        SELECT id, game_name, playtime_minutes, last_played
-                        FROM playtime_archive
-                        WHERE game_type=? AND store_key=? AND store_key != ''
-                        ORDER BY archived_at DESC LIMIT 1
-                    """, (_gt, _store)).fetchone()
-                    if arc and arc[2] > 0:
-                        con.execute("UPDATE games SET playtime_minutes=?, last_played=? WHERE id=?",
-                                    (arc[2], arc[3], new_id))
-                        con.commit()
-                        self._set_status(f"Restored {arc[2] // 60}h playtime for {_gname}")
+                    # GOG: keyed by gog_id — silent full restore
+                    _gog_id_restore = (d.get("gog_id") or "").strip()
+                    if _gog_id_restore:
+                        arc = con.execute("""
+                            SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
+                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
+                            FROM playtime_archive
+                            WHERE game_type=? AND store_key=? AND store_key != ''
+                            ORDER BY archived_at DESC LIMIT 1
+                        """, (_gt, _gog_id_restore)).fetchone()
+                        if arc:
+                            con.execute(
+                                "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
+                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                                (arc[2], arc[3], arc[4],
+                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                                 new_id))
+                            con.commit()
+                            self._set_status(f"Restored playtime and settings for {_gname}")
+                            # Restore categories — match by name, skip any that no longer exist
+                            _arc_cats = (arc[27] or "").strip()
+                            if _arc_cats:
+                                _cat_names_to_restore = [c.strip() for c in _arc_cats.split(",") if c.strip()]
+                                if _cat_names_to_restore:
+                                    _existing_cats = {c["name"]: c["id"] for c in db_get_categories()}
+                                    _restore_ids = [_existing_cats[n] for n in _cat_names_to_restore if n in _existing_cats]
+                                    if _restore_ids:
+                                        db_set_game_categories(new_id, _restore_ids)
 
                 else:
-                    # Native / Proton: key by exe filename — prompt user
+                    # Native / Proton: keyed by exe filename.
+                    # Match is ambiguous (exe names can collide) so we prompt
+                    # once for both playtime and config together.
                     _exe_filename = Path(_exe).name if _exe else ""
                     if _exe_filename:
                         arc = con.execute("""
-                            SELECT id, game_name, playtime_minutes, last_played
+                            SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
+                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
                             FROM playtime_archive
                             WHERE exe_filename=? AND game_type=?
                             ORDER BY archived_at DESC LIMIT 1
                         """, (_exe_filename, _gt)).fetchone()
-                        if arc and arc[2] > 0:
-                            _lp_display = _format_last_played(arc[3]) if arc[3] else ""
-                            if NAGOMessageBox.restore_playtime(
-                                self, arc[1], _exe_filename, arc[2], _lp_display
-                            ):
-                                con.execute(
-                                    "UPDATE games SET playtime_minutes=?, last_played=? WHERE id=?",
-                                    (arc[2], arc[3], new_id))
-                                con.commit()
-                                self._set_status(f"Restored {arc[2] // 60}h playtime for {_gname}")
+                        if arc:
+                            # Silent restore — no prompt for Native/Proton config/playtime.
+                            # Only the prefix conflict (handled below) prompts the user.
+                            con.execute(
+                                "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
+                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                                (arc[2], arc[3], arc[4],
+                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                                 new_id))
+                            con.commit()
+                            self._set_status(f"Restored playtime and settings for {_gname}")
+                            # Restore categories — match by name, skip any that no longer exist
+                            _arc_cats = (arc[27] or "").strip()
+                            if _arc_cats:
+                                _cat_names_to_restore = [c.strip() for c in _arc_cats.split(",") if c.strip()]
+                                if _cat_names_to_restore:
+                                    _existing_cats = {c["name"]: c["id"] for c in db_get_categories()}
+                                    _restore_ids = [_existing_cats[n] for n in _cat_names_to_restore if n in _existing_cats]
+                                    if _restore_ids:
+                                        db_set_game_categories(new_id, _restore_ids)
 
                 # ── Prefix restore ─────────────────────────────────────────────
                 _prefix_restore_msg = ""
