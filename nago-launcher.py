@@ -116,7 +116,7 @@ sys.excepthook = _safe_excepthook
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME = "NAGO"
 VERSION  = "1.0.0"
-BUILD    = "29-06-2026 17:33"
+BUILD    = "01-07-2026 06:10"
 
 # Locale-safe date helpers — always English month abbreviations regardless of system locale.
 _MONTH_ABBR = ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
@@ -226,8 +226,14 @@ def _nago_asset(*parts: str) -> Path:
 # Phosphor icon font — bundled alongside nago-launcher.py
 # MIT License © 2023 Phosphor Icons — see https://github.com/phosphor-icons/core
 _PHOSPHOR_TTF = _nago_asset("icons", "Phosphor.ttf")
+# Phosphor Fill weight, subsetted to just the star glyphs (star, star-half).
+# Separate file because in Phosphor the solid/outline distinction is a weight,
+# not a codepoint — the Regular file above has no filled star. Used to paint
+# the filled portion of rating stars; the Regular file paints the empty outline.
+_PHOSPHOR_FILL_TTF = _nago_asset("icons", "Phosphor-Fill-stars.ttf")
 LOGO_PATH     = _nago_asset("icons", "nago-logo.png")
-_PHOSPHOR_FONT_ID = -1   # QFontDatabase id, populated in _load_phosphor_font()
+_PHOSPHOR_FONT_ID = -1        # QFontDatabase id, populated in _load_phosphor_font()
+_PHOSPHOR_FILL_FONT_ID = -1   # QFontDatabase id for the Fill-weight star subset
 
 # Codepoints for every icon used in NAGO (Phosphor Regular v2.1.2)
 PH = {
@@ -300,6 +306,11 @@ PH = {
     "game-controller":          0x0E26E,
     "linux-logo":               0x0EB02,
     "steam-logo":               0x0EAD4,
+    # ── Rating ────────────────────────────────────────────────────────────────
+    # Same codepoint in Regular (outline) and Fill (solid) families — the family
+    # selects the weight. star-half (0x0E70A) is also in the subset but unused:
+    # partial fill is done with a clip rect, not the half glyph.
+    "star":                     0x0E46A,
 }
 
 
@@ -761,19 +772,23 @@ class NAGOCheckBox(QWidget):
 
 
 def _load_phosphor_font():
-    """Load the Phosphor TTF into Qt's font database. Safe to call multiple times."""
-    global _PHOSPHOR_FONT_ID
-    if _PHOSPHOR_FONT_ID != -1:
-        return                          # already loaded
-    if not _PHOSPHOR_TTF.exists():
-        return                          # font file missing
+    """Load the Phosphor TTFs into Qt's font database. Safe to call multiple times."""
+    global _PHOSPHOR_FONT_ID, _PHOSPHOR_FILL_FONT_ID
     if QApplication.instance() is None:
         return                          # QApplication not yet created
     from PyQt6.QtGui import QFontDatabase
-    _PHOSPHOR_FONT_ID = QFontDatabase.addApplicationFont(str(_PHOSPHOR_TTF))
-    if _PHOSPHOR_FONT_ID == -1:
-        print(f"[NAGO] Warning: failed to load Phosphor font from {_PHOSPHOR_TTF}",
-              file=sys.stderr)
+    if _PHOSPHOR_FONT_ID == -1 and _PHOSPHOR_TTF.exists():
+        _PHOSPHOR_FONT_ID = QFontDatabase.addApplicationFont(str(_PHOSPHOR_TTF))
+        if _PHOSPHOR_FONT_ID == -1:
+            print(f"[NAGO] Warning: failed to load Phosphor font from {_PHOSPHOR_TTF}",
+                  file=sys.stderr)
+    # Fill-weight star subset — optional. If absent, filled stars degrade to
+    # outline (rendered from the Regular family) rather than crashing.
+    if _PHOSPHOR_FILL_FONT_ID == -1 and _PHOSPHOR_FILL_TTF.exists():
+        _PHOSPHOR_FILL_FONT_ID = QFontDatabase.addApplicationFont(str(_PHOSPHOR_FILL_TTF))
+        if _PHOSPHOR_FILL_FONT_ID == -1:
+            print(f"[NAGO] Warning: failed to load Phosphor Fill font from {_PHOSPHOR_FILL_TTF}",
+                  file=sys.stderr)
 
 
 def _ph_family() -> str:
@@ -781,6 +796,16 @@ def _ph_family() -> str:
     from PyQt6.QtGui import QFontDatabase
     if _PHOSPHOR_FONT_ID != -1:
         families = QFontDatabase.applicationFontFamilies(_PHOSPHOR_FONT_ID)
+        if families:
+            return families[0]
+    return ""
+
+
+def _ph_fill_family() -> str:
+    """Return the loaded Phosphor Fill (star subset) family name, or empty string."""
+    from PyQt6.QtGui import QFontDatabase
+    if _PHOSPHOR_FILL_FONT_ID != -1:
+        families = QFontDatabase.applicationFontFamilies(_PHOSPHOR_FILL_FONT_ID)
         if families:
             return families[0]
     return ""
@@ -6328,6 +6353,18 @@ def _apply_card_width(width: int):
     _SHADOW_CACHE.clear()
 
 
+def _pill_sizes() -> tuple[int, int, int, int, int]:
+    """Return (icon_px, text_px, pad_v, pad_h, radius) scaled to CARD_W.
+    Baseline: icon=13, text=14, pad=4/9, radius=6 at CARD_W=185."""
+    scale   = CARD_W / 185.0
+    icon_px = max(10, round(13 * scale))
+    text_px = max(11, round(14 * scale))
+    pad_v   = max(3,  round(4  * scale))
+    pad_h   = max(6,  round(9  * scale))
+    radius  = max(4,  round(6  * scale))
+    return icon_px, text_px, pad_v, pad_h, radius
+
+
 _SHADOW_CACHE: dict[tuple, "QPixmap"] = {}
 _SHADOW_BLUR  = 16   # logical px
 _SHADOW_OY    =  6   # downward offset
@@ -6981,7 +7018,9 @@ def init_db():
             optiscaler_dll  TEXT DEFAULT '',
             fsr4_indicator  INTEGER DEFAULT 0,
             install_dir     TEXT DEFAULT '',
-            custom_save_paths TEXT DEFAULT ''
+            custom_save_paths TEXT DEFAULT '',
+            mangohud_enabled INTEGER DEFAULT 0,
+            rating REAL DEFAULT 0
         )
     """)
     # Migrate existing DBs that pre-date the umu_* columns
@@ -7021,6 +7060,8 @@ def init_db():
         ("install_dir",      "TEXT DEFAULT ''"),
         ("custom_save_paths", "TEXT DEFAULT ''"),
         ("use_ludusavi",     "INTEGER DEFAULT 1"),
+        ("mangohud_enabled", "INTEGER DEFAULT 0"),
+        ("rating",           "REAL DEFAULT 0"),
     ]:
         if col not in existing_cols:
             con.execute(f"ALTER TABLE games ADD COLUMN {col} {ddl}")
@@ -7077,7 +7118,9 @@ def init_db():
             video_decode_mode    TEXT DEFAULT 'default',
             vn_jp_locale         INTEGER DEFAULT 0,
             added_at             TEXT DEFAULT '',
-            category_names       TEXT DEFAULT ''
+            category_names       TEXT DEFAULT '',
+            mangohud_enabled     INTEGER DEFAULT 0,
+            rating               REAL    DEFAULT 0
         )
     """)
     # Migrate playtime_archive to add prefix_path if missing
@@ -7113,6 +7156,8 @@ def init_db():
         ("added_at",           "TEXT DEFAULT ''"),
         ("category_names",     "TEXT DEFAULT ''"),
         ("use_ludusavi",       "INTEGER DEFAULT 1"),
+        ("mangohud_enabled",   "INTEGER DEFAULT 0"),
+        ("rating",             "REAL DEFAULT 0"),
     ]:
         if _pac not in pa_cols:
             con.execute(f"ALTER TABLE playtime_archive ADD COLUMN {_pac} {_padef}")
@@ -7154,9 +7199,10 @@ def init_db():
         UPDATE games
         SET hdr_enabled = 0,
             gamescope_enabled = 0,
-            upscale_enabled = 0
+            upscale_enabled = 0,
+            mangohud_enabled = 0
         WHERE game_type = 'steam'
-          AND (hdr_enabled = 1 OR gamescope_enabled = 1 OR upscale_enabled = 1)
+          AND (hdr_enabled = 1 OR gamescope_enabled = 1 OR upscale_enabled = 1 OR mangohud_enabled = 1)
     """)
 
     # Migrate game_categories to add sort_pos if missing
@@ -8099,6 +8145,115 @@ class _CardHoverOverlay(QWidget):
         p.end()
 
 
+def _star_fill_color() -> str:
+    """Filled-star yellow. Deeper gold on light theme so it reads on a white
+    dialog surface; warm gold on dark. Themed via _t(), never a bare literal."""
+    return _t("#FFC93C", "#E0A800")
+
+
+def _star_empty_color() -> str:
+    """Empty-star outline grey, theme-aware."""
+    return _t("#4a4a54", "#c8c8cc")
+
+
+class StarRating(QWidget):
+    """Interactive 5-star, half-step rating widget.
+
+    - Click a star to set; click the current value again to clear to 0.
+    - Hovering previews the value under the cursor (left half = x.5, right = x.0).
+    - The empty outline is painted from the Phosphor Regular family; the filled
+      portion from the Fill family, clipped to a fraction of the cell width so
+      any half-step renders as a true partial fill (no dedicated half glyph
+      needed, and not limited to halves if that ever changes).
+    """
+    rating_changed = pyqtSignal(float)
+
+    def __init__(self, value: float = 0.0, star_px: int = 26, parent=None):
+        super().__init__(parent)
+        self._star_px = star_px
+        self._gap = max(4, star_px // 6)
+        self._value = self._snap(value)
+        self._hover = None
+        self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setFixedSize(self._star_px * 5 + self._gap * 4, self._star_px + 4)
+
+    @staticmethod
+    def _snap(v) -> float:
+        v = max(0.0, min(5.0, float(v or 0)))
+        return round(v * 2) / 2.0
+
+    def value(self) -> float:
+        return self._value
+
+    def setValue(self, v):
+        self._value = self._snap(v)
+        self.update()
+        self.rating_changed.emit(self._value)
+
+    def _value_at(self, x: int) -> float:
+        cell = self._star_px + self._gap
+        idx = max(0, min(4, int(x // cell)))
+        within = x - idx * cell
+        half = 0.5 if within < self._star_px / 2 else 1.0
+        return idx + half
+
+    def mouseMoveEvent(self, e):
+        self._hover = self._snap(self._value_at(int(e.position().x())))
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = None
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            # Right-click anywhere on the stars clears to unrated.
+            self._value = 0.0
+            self._hover = None
+            self.update()
+            self.rating_changed.emit(self._value)
+            return
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        v = self._snap(self._value_at(int(e.position().x())))
+        # Click the value that's already set → clear to unrated.
+        self._value = 0.0 if v == self._value else v
+        self._hover = self._value if self._value else None
+        self.update()
+        self.rating_changed.emit(self._value)
+
+    def paintEvent(self, e):
+        _load_phosphor_font()
+        eff = self._hover if self._hover is not None else self._value
+        empty_fam = _ph_family()
+        fill_fam = _ph_fill_family() or empty_fam
+        if not empty_fam:
+            return
+        glyph = chr(PH.get("star", 0x0020))
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ef = QColor(_star_empty_color())
+        ff = QColor(_star_fill_color())
+        f_empty = QFont(empty_fam); f_empty.setPixelSize(self._star_px)
+        f_fill = QFont(fill_fam);  f_fill.setPixelSize(self._star_px)
+        cell = self._star_px + self._gap
+        for i in range(5):
+            x = i * cell
+            r = QRectF(x, 2, self._star_px, self._star_px)
+            p.setFont(f_empty); p.setPen(ef)
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, glyph)
+            frac = max(0.0, min(1.0, eff - i))
+            if frac > 0:
+                p.save()
+                p.setClipRect(QRectF(x, 2, self._star_px * frac, self._star_px))
+                p.setFont(f_fill); p.setPen(ff)
+                p.drawText(r, Qt.AlignmentFlag.AlignCenter, glyph)
+                p.restore()
+        p.end()
+
+
 class GameCard(QFrame):
     launch_requested       = pyqtSignal(dict)
     edit_requested         = pyqtSignal(dict)
@@ -8180,6 +8335,12 @@ class GameCard(QFrame):
         self._hover_overlay.set_play_visible(False)
         self._hover_overlay.fade_in()
         self._hover_timer.start(300)
+        # Stop auto-hide and show chip while hovering (no timer restart).
+        # Skip entirely if chip is disabled on this card (e.g. dialog cover card).
+        if not getattr(self, "_chip_disabled", False):
+            if hasattr(self, "_chip_timer"):
+                self._chip_timer.stop()
+            self._update_rating_chip(start_timer=False)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
@@ -8189,6 +8350,10 @@ class GameCard(QFrame):
         # opening causes Qt to send leaveEvent which would kill the tint.
         if not self._context_menu_open:
             self._hover_overlay.fade_out()
+        # Restart auto-hide timer when cursor leaves if the chip is visible.
+        if hasattr(self, "_chip_timer") and hasattr(self, "_rating_chip") \
+                and self._rating_chip.isVisible():
+            self._chip_timer.start()
         super().leaveEvent(event)
 
     def _build(self):
@@ -8235,6 +8400,12 @@ class GameCard(QFrame):
         self._playtime_label = QLabel(self)
         self._playtime_label.setTextFormat(Qt.TextFormat.RichText)
         self._playtime_label.setObjectName("playtimeBadge")
+        _pip, _ptp, _ppv, _pph, _pr = _pill_sizes()
+        self._playtime_label.setStyleSheet(
+            f"background: rgba(10,10,14,0.70); color: #e4e4e7;"
+            f" font-size: {_ptp}px; font-weight: 600;"
+            f" padding: {_ppv}px {_pph}px; border-radius: {_pr}px;"
+        )
         self._set_playtime_text(pt_text)
         self._playtime_label.adjustSize()
         self._playtime_label.move(
@@ -8243,6 +8414,25 @@ class GameCard(QFrame):
         )
         self._playtime_label.setVisible(bool(pt_text))
 
+        # ── Rating chip — top-left, read-only ─────────────────────────────
+        # Shares the top-left slot with the running dot and backup pill, which
+        # take priority (they're live status). Shown only when rated and idle.
+        # Transparent to mouse events so it never eats a card click/launch.
+        self._rating_chip = QLabel("", self)
+        self._rating_chip.setObjectName("ratingChip")
+        self._rating_chip.setTextFormat(Qt.TextFormat.RichText)
+        self._rating_chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._rating_chip.setStyleSheet(
+            "background: rgba(10,10,14,0.70); border-radius: 6px; padding: 4px 9px;"
+        )
+        self._rating_chip.hide()
+        # Auto-hide timer — hides the chip after 10 s of no hover.
+        self._chip_timer = QTimer(self)
+        self._chip_timer.setSingleShot(True)
+        self._chip_timer.setInterval(5_000)
+        self._chip_timer.timeout.connect(self._rating_chip.hide)
+        self._update_rating_chip()
+
         # Build placeholder cover
         self._set_placeholder()
 
@@ -8250,10 +8440,11 @@ class GameCard(QFrame):
         """Set playtime label with a small clock icon prefix using Phosphor font."""
         ph_fam = _ph_family()
         clock_char = chr(PH["clock"])
+        _icon_px, _text_px, *_ = _pill_sizes()
         if ph_fam and text:
             self._playtime_label.setText(
-                f"<span style='font-family:{ph_fam}; font-size:11px;'>{clock_char}</span>"
-                f"<span style='font-size:12px;'> {text}</span>"
+                f"<span style='font-family:{ph_fam}; font-size:{_icon_px}px;'>{clock_char}</span>"
+                f"<span style='font-size:{_text_px}px;'> {text}</span>"
             )
         else:
             self._playtime_label.setText(text)
@@ -8274,6 +8465,7 @@ class GameCard(QFrame):
         """Update card metadata in-place after an edit — no rebuild, no flash."""
         self.game.update(d)
         self._name_label.setText(d.get("name", self.game.get("name", "")))
+        self._update_rating_chip()
 
     def _set_placeholder(self, all_corners: bool = False, size: tuple = None):
         # Render at physical pixels — same DPR logic as set_cover.
@@ -8512,9 +8704,44 @@ class GameCard(QFrame):
         self._backup_pill.move(7, 7)
         self._backup_pill.show()
         self._backup_pill.raise_()
+        if hasattr(self, "_rating_chip"):
+            self._rating_chip.hide()
         delay = {"success": 3000, "failed": 5000}.get(state, 0)
         if delay:
-            QTimer.singleShot(delay, self._backup_pill.hide)
+            QTimer.singleShot(delay, self._dismiss_backup_pill)
+
+    def _dismiss_backup_pill(self):
+        """Hide the backup pill and restore the rating chip if one is due."""
+        self._backup_pill.hide()
+        self._update_rating_chip()
+
+    def _update_rating_chip(self, start_timer: bool = True):
+        """Show the read-only rating chip top-left, but only when the game is
+        rated and the slot isn't claimed by the running dot or backup pill."""
+        if not hasattr(self, "_rating_chip") or getattr(self, "_chip_disabled", False):
+            return
+        r = StarRating._snap(self.game.get("rating") or 0)
+        if r <= 0 or self.is_running or self._backup_pill.isVisible():
+            self._rating_chip.hide()
+            return
+        fill_fam = _ph_fill_family() or _ph_family()
+        star = chr(PH.get("star", 0x0020))
+        col = _star_fill_color()
+        num = f"{r:g}"
+        _icon_px, _text_px, _pad_v, _pad_h, _radius = _pill_sizes()
+        self._rating_chip.setStyleSheet(
+            f"background: rgba(10,10,14,0.70); border-radius: {_radius}px;"
+            f" padding: {_pad_v}px {_pad_h}px;"
+        )
+        self._rating_chip.setText(
+            f"<span style='font-family:{fill_fam}; font-size:{_icon_px}px; color:{col};'>{star}</span>"
+            f"<span style='font-size:{_text_px}px; font-weight:600; color:{col};'> {num}</span>"
+        )
+        self._rating_chip.adjustSize()
+        self._rating_chip.move(7, 7)
+        self._rating_chip.show()
+        if start_timer and hasattr(self, "_chip_timer"):
+            self._chip_timer.start()
 
     def set_running(self, running: bool):
         """Show or hide the green 'Running' badge; hide playtime while running."""
@@ -8524,11 +8751,13 @@ class GameCard(QFrame):
             self._running_dot.show()
             self._running_dot.raise_()
             self._playtime_label.hide()
+            self._rating_chip.hide()
         else:
             self._running_dot.hide()
             # Only restore playtime if there's something to show
             if format_playtime(self.game.get("playtime_minutes") or 0):
                 self._playtime_label.show()
+            self._update_rating_chip()
         # Play button should not appear while the game is already running
         self._hover_overlay.set_running(running)
 
@@ -8546,6 +8775,16 @@ class GameCard(QFrame):
         self.launch_requested.emit(self.game)
 
     def contextMenuEvent(self, event):
+        # Refresh this card's game dict from the DB before building the menu.
+        # Backups — from the Edit dialog's Save-Backups card, or auto-backup on
+        # game exit — write ludusavi_title / last_backup / backup_location
+        # straight to the DB without going through update_game_data, so the
+        # card's cached dict goes stale. That previously hid "Open Saves Backup"
+        # (and could misroute it) until an app restart rebuilt the cards.
+        # Re-reading here keeps the menu honest without a restart.
+        _fresh = _db_load_game(self.game.get("id"))
+        if _fresh:
+            self.game.update(_fresh)
         menu = QMenu(self)
         menu.setWindowFlags(menu.windowFlags()
                             | Qt.WindowType.FramelessWindowHint
@@ -9713,6 +9952,8 @@ class GameDialog(_NAGODialog):
         self._dlg_cover_card = GameCard(_dlg_game_ref, accent_color=self.config.get("accent_color", DEFAULT_ACCENT), parent=self)
         self._dlg_cover_card._name_label.hide()
         self._dlg_cover_card._playtime_label.hide()
+        self._dlg_cover_card._rating_chip.hide()
+        self._dlg_cover_card._chip_disabled = True   # never show chip on the dialog cover
         # Resize to dialog thumbnail dimensions
         self._dlg_cover_card.setFixedSize(COVER_W, HEADER_H)
         # Cover area fills the full card in the dialog (no bottom strip)
@@ -10199,29 +10440,32 @@ class GameDialog(_NAGODialog):
         ip.addStretch()
         ip.addWidget(stats_row)
 
-        # Category badges — separator + right-aligned row, only if game has categories
+        # Rating + category badges — separator + combined row.
+        # StarRating (22 px) on the left; category badges right-aligned.
+        # Row always shown for saved games so the user can set/clear the rating.
         if self.game and self.game.get("id"):
             _cat_ids = db_get_game_categories(self.game["id"])
-            if _cat_ids:
-                _all_cats = {c["id"]: c["name"] for c in db_get_categories()}
-                _sep = QFrame()
-                _sep.setFrameShape(QFrame.Shape.HLine)
-                _sep.setObjectName("dialogSep")
-                ip.addWidget(_sep)
-                cat_row = QWidget()
-                cat_h = QHBoxLayout(cat_row)
-                cat_h.setContentsMargins(0, 0, 0, 0)
-                cat_h.setSpacing(5)
-                cat_h.addStretch()
-                for _cid in _cat_ids[:7]:
-                    _cname = _all_cats.get(_cid)
-                    if not _cname:
-                        continue
-                    cat_badge = QLabel(_cname)
-                    cat_badge.setObjectName("catBadge")
-                    cat_badge.setFixedHeight(24)
-                    cat_h.addWidget(cat_badge)
-                ip.addWidget(cat_row)
+            _all_cats = {c["id"]: c["name"] for c in db_get_categories()} if _cat_ids else {}
+            _sep = QFrame()
+            _sep.setFrameShape(QFrame.Shape.HLine)
+            _sep.setObjectName("dialogSep")
+            ip.addWidget(_sep)
+            _rating_cat_row = QWidget()
+            _rc_h = QHBoxLayout(_rating_cat_row)
+            _rc_h.setContentsMargins(0, 0, 0, 0)
+            _rc_h.setSpacing(6)
+            self._rating_widget = StarRating(self.game.get("rating") or 0, star_px=22)
+            _rc_h.addWidget(self._rating_widget)
+            _rc_h.addStretch()
+            for _cid in _cat_ids[:7]:
+                _cname = _all_cats.get(_cid)
+                if not _cname:
+                    continue
+                cat_badge = QLabel(_cname)
+                cat_badge.setObjectName("catBadge")
+                cat_badge.setFixedHeight(24)
+                _rc_h.addWidget(cat_badge)
+            ip.addWidget(_rating_cat_row)
 
         right_col_v.addWidget(merged_card)
         info_h.addWidget(right_col)
@@ -10945,6 +11189,30 @@ class GameDialog(_NAGODialog):
         # re-sync the Wayland checkbox whenever gamescope is toggled.
         self._gamescope_cb.toggled.connect(lambda _: self._sync_upscale_conflicts())
 
+        # ── MangoHud checkbox — forces MANGOHUD=1/0 at launch, overriding
+        # both global and per-game env vars (the most specific layer wins).
+        # Same missing-binary stash pattern as Gamescope above. Only acts when
+        # checked (force-enables MANGOHUD); unchecked leaves global/per-game
+        # env vars in control.
+        _mh_enabled = bool(self.game.get("mangohud_enabled", 0) if self.game else 0)
+        self._mangohud_cb = NAGOCheckBox("MangoHud")
+        self._mangohud_cb.setChecked(_mh_enabled)
+        self._mangohud_cb.setToolTip(
+            "Forces the MangoHud performance overlay on for this game.\n"
+            "Overrides MANGOHUD set in global or per-game environment variables.\n"
+            "Unchecked: existing MANGOHUD settings (or none) apply as normal.\n"
+            "Requires MangoHud to be installed."
+        )
+        if not shutil.which("mangohud"):
+            self._mh_missing_pref = _mh_enabled
+            self._mangohud_cb.setChecked(False)
+            self._mangohud_cb.setEnabled(False)
+            self._mangohud_cb.setToolTip(
+                "MangoHud is not installed.\n"
+                "Install via your distro's package manager.\n"
+                "Then reopen this dialog."
+            )
+
         # ── Bottom cards row ─────────────────────────────────────────────
         # Edit: Display (+ Save Backups). Add: Proton/umu card instead —
         # swapped with the Compatibility tab, which gets Display for Add.
@@ -11297,7 +11565,7 @@ class GameDialog(_NAGODialog):
                 self._fsr4_combo.setCurrentIndex(_i)
                 break
         self._fsr4_combo.setEnabled(bool(_saved_fsr4))
-        _iu_row.addWidget(self._fsr4_combo)
+        _iu_row.addWidget(self._fsr4_combo, 2)
         _iu_row.addSpacing(8)
 
         _iu_sep = QFrame()
@@ -11328,8 +11596,7 @@ class GameDialog(_NAGODialog):
                 self._opti_dll_combo.setCurrentIndex(_i)
                 break
         self._opti_dll_combo.setEnabled(bool(_saved_opti))
-        _iu_row.addWidget(self._opti_dll_combo)
-        _iu_row.addStretch()
+        _iu_row.addWidget(self._opti_dll_combo, 1)
         _iu_v.addLayout(_iu_row)
 
         self._fsr4_cb.toggled.connect(self._fsr4_combo.setEnabled)
@@ -11383,8 +11650,7 @@ class GameDialog(_NAGODialog):
                 self._upscale_model_combo.setCurrentIndex(_i)
                 break
         self._upscale_model_combo.setEnabled(_upscale_enabled)
-        _upscale_row.addWidget(self._upscale_model_combo)
-        _upscale_row.addStretch()
+        _upscale_row.addWidget(self._upscale_model_combo, 1)
 
         self._upscale_cb.toggled.connect(self._upscale_model_combo.setEnabled)
         # Upscaling forces XWayland, so the Wayland toggle can't apply while it's on —
@@ -11474,6 +11740,7 @@ class GameDialog(_NAGODialog):
         v.addWidget(self._section_label("Display"))
         v.addWidget(self._hdr_cb)
         v.addWidget(self._gamescope_cb)
+        v.addWidget(self._mangohud_cb)
         v.addStretch()
 
         _is_steam = (self.game.get("game_type") if self.game else None) == "steam"
@@ -11514,6 +11781,7 @@ class GameDialog(_NAGODialog):
         self._bk_auto_cb.setToolTip("Automatically back up saves when the game exits.")
         title_row.addWidget(self._bk_auto_cb)
         v.addLayout(title_row)
+        v.addStretch()
 
         # Manual / Auto backup status labels, plus the busy/prompt status —
         # all on one shared row. _bk_status is hidden while idle, so the manual
@@ -11563,12 +11831,18 @@ class GameDialog(_NAGODialog):
         self._bk_restore_btn.clicked.connect(self._on_restore)
         btn_row.addWidget(self._bk_backup_btn)
         btn_row.addWidget(self._bk_restore_btn)
-        self._bk_edit_paths_btn = QPushButton("  Edit paths…")
+        self._bk_edit_paths_btn = QPushButton("  Save paths")
         self._bk_edit_paths_btn.setIcon(ph_icon("folder-simple", 18))
         self._bk_edit_paths_btn.setIconSize(QSize(18, 18))
         self._bk_edit_paths_btn.setObjectName("secondary")
         self._bk_edit_paths_btn.setToolTip("Edit the manually selected save paths for this game.")
         self._bk_edit_paths_btn.clicked.connect(self._on_edit_manual_paths)
+        # Re-run the card's visibility logic when Use Ludusavi is toggled, so the
+        # "Set save paths…/Edit paths…" button surfaces the instant the box is
+        # unchecked (manual becomes the only mode). Connected AFTER the initial
+        # setChecked above, so it never fires during construction. The manifest-
+        # miss auto-disable rides the same toggled signal.
+        self._bk_use_ludusavi_cb.toggled.connect(lambda _: self._refresh_backup_card())
         self._bk_edit_paths_btn.hide()
         btn_row.addWidget(self._bk_edit_paths_btn)
         btn_row.addStretch()
@@ -11710,10 +11984,20 @@ class GameDialog(_NAGODialog):
         _manual_raw_exists = _manual_root.is_dir() and any(_manual_root.iterdir())
         self._bk_restore_btn.setEnabled(manual_exists or auto_exists or _manual_raw_exists)
 
-        # Show Edit paths... button only when custom paths are stored
+        # Show the manual-paths button when manual paths are actually in play:
+        # Show the manual-paths button when manual paths are in play:
+        # either some are stored, or Use Ludusavi is off (manual is then the
+        # only backup mode and needs paths). Hidden for a ludusavi-on game with
+        # no paths, where the manual picker is irrelevant.
         if hasattr(self, "_bk_edit_paths_btn"):
             has_paths = bool(self._load_custom_paths())
-            if has_paths:
+            _lud_on = (self._bk_use_ludusavi_cb.isChecked()
+                       if hasattr(self, "_bk_use_ludusavi_cb") else True)
+            if has_paths or not _lud_on:
+                self._bk_edit_paths_btn.setText("  Save paths")
+                self._bk_edit_paths_btn.setToolTip(
+                    "Edit the manually selected save paths for this game."
+                )
                 self._bk_edit_paths_btn.show()
             else:
                 self._bk_edit_paths_btn.hide()
@@ -14275,6 +14559,11 @@ class GameDialog(_NAGODialog):
             "upscale_enabled":     0 if db_game_type == "steam" else (
                                    1 if (hasattr(self, "_upscale_cb") and self._upscale_cb.isChecked()) else 0),
             "upscale_model":       (self._upscale_model_combo.currentData() if hasattr(self, "_upscale_model_combo") else "fast") or "fast",
+            "mangohud_enabled":    0 if db_game_type == "steam" else (
+                                   (1 if self._mh_missing_pref else 0)
+                                   if hasattr(self, "_mh_missing_pref")
+                                   else (1 if (hasattr(self, "_mangohud_cb") and self._mangohud_cb.isChecked()) else 0)),
+            "rating":              (self._rating_widget.value() if hasattr(self, "_rating_widget") else 0.0),
             "hdr_enabled":         0 if db_game_type == "steam" else (
                                    (1 if getattr(self, "_hdr_user_pref", False) else 0)
                                    if (bool(getattr(self, "_upscale_cb", None) and self._upscale_cb.isChecked()))
@@ -16733,6 +17022,29 @@ class LibraryPage(QWidget):
                 # Note: launch_args are intentionally NOT appended for Steam-type games —
                 # Steam manages per-game launch options through its own UI.
             elif game["game_type"] == "native":
+                # Auto-fix missing execute bit — common after extracting a new
+                # version from an archive. The user explicitly chose this file
+                # as the game executable, so chmod +x is safe and expected.
+                _native_exe = Path(game["exe_path"])
+                if _native_exe.exists() and not os.access(str(_native_exe), os.X_OK):
+                    try:
+                        _native_exe.chmod(_native_exe.stat().st_mode | 0o111)
+                        _NAGOLog.launch(f"auto-chmod +x  {_native_exe}")
+                    except Exception as _ce:
+                        _NAGOLog.launch(f"[warn] chmod +x failed: {_ce}")
+                # RenPy games ship a matching binary under lib/py3-linux-x86_64/
+                # and lib/linux-x86_64/ that also needs the execute bit. Strip
+                # the .sh extension from the exe name and chmod it in both dirs
+                # if found. Done every launch — cheap, and handles re-extracts.
+                _renpy_stem = _native_exe.stem
+                for _renpy_lib in ("lib/py3-linux-x86_64", "lib/linux-x86_64"):
+                    _renpy_bin = _native_exe.parent / _renpy_lib / _renpy_stem
+                    if _renpy_bin.exists() and not os.access(str(_renpy_bin), os.X_OK):
+                        try:
+                            _renpy_bin.chmod(_renpy_bin.stat().st_mode | 0o111)
+                            _NAGOLog.launch(f"auto-chmod +x  {_renpy_bin}")
+                        except Exception as _ce:
+                            _NAGOLog.launch(f"[warn] chmod +x renpy bin failed: {_ce}")
                 cmd = [game["exe_path"], *launch_args]
                 env = os.environ.copy()
             else:
@@ -16885,6 +17197,14 @@ class LibraryPage(QWidget):
                         f"Ignored {len(blocked)} reserved env var(s): {', '.join(blocked)}"
                     )
 
+            # MangoHud checkbox only acts when checked — it force-enables
+            # MANGOHUD, overriding global/per-game env vars. Unchecked means
+            # "NAGO doesn't care": existing global/per-game MANGOHUD settings
+            # (or none at all) apply normally. Steam-type games never reach
+            # here with mangohud_enabled=1 (zeroed at save time).
+            if game["game_type"] != "steam" and bool(game.get("mangohud_enabled", 0)):
+                env["MANGOHUD"] = "1"
+
             # AI upscaler forces XWayland (PROTON_ENABLE_WAYLAND=0) on Proton/GOG so it can
             # capture the game window. Apply it to env HERE — before the launch log is
             # written below — so the logged env-diff reflects what the game actually
@@ -16991,6 +17311,7 @@ class LibraryPage(QWidget):
                         try:
                             _up_proc = subprocess.Popen(
                                 _cmd,
+                                env=env,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 preexec_fn=_set_pdeathsig_sigterm,
@@ -17108,8 +17429,24 @@ class LibraryPage(QWidget):
                     _lf.close()
                 except Exception:
                     pass
-            NAGOMessageBox.critical(None, "Launch Error",
-                str(e) + "\n\nSee Game Log for details.")
+            if isinstance(e, FileNotFoundError):
+                _exe = (game.get("exe_path") or "") if isinstance(game, dict) else ""
+                _user_msg = (
+                    f"Game executable not found:\n{_exe}\n\nCheck the path in Edit \u2192 Game."
+                    if _exe else
+                    "Game executable not found. Check the path in Edit \u2192 Game."
+                )
+            elif isinstance(e, PermissionError):
+                _exe = (game.get("exe_path") or "") if isinstance(game, dict) else ""
+                _user_msg = (
+                    f"Permission denied — could not make executable runnable:\n{_exe}"
+                    "\n\nTry: chmod +x \"<path>\" in a terminal."
+                    if _exe else
+                    "Permission denied launching the game executable.\n\nSee Game Log for details."
+                )
+            else:
+                _user_msg = str(e) + "\n\nSee Game Log for details."
+            NAGOMessageBox.critical(None, "Launch Error", _user_msg)
 
     def _auto_backup_game(self, gid: int) -> None:
         """
@@ -17648,7 +17985,8 @@ class LibraryPage(QWidget):
                                  gamescope_enabled=?,
                                  upscale_enabled=?, upscale_model=?,
                                  hdr_enabled=?, hdr_monitor=?, gog_id=?,
-                                 fsr4_upgrade=?, optiscaler_dll=?, fsr4_indicator=?
+                                 fsr4_upgrade=?, optiscaler_dll=?, fsr4_indicator=?,
+                                 mangohud_enabled=?, rating=?
                 WHERE id=?
             """, (d["name"], d["exe_path"], d["game_type"], d["proton_path"],
                   d["umu_enabled"], d["umu_gameid"], d["umu_store"],
@@ -17663,6 +18001,7 @@ class LibraryPage(QWidget):
                   d.get("upscale_enabled", 0), d.get("upscale_model", "fast"),
                   d.get("hdr_enabled", 0), d.get("hdr_monitor", ""), d.get("gog_id", ""),
                   d.get("fsr4_upgrade", ""), d.get("optiscaler_dll", ""), d.get("fsr4_indicator", 0),
+                  d.get("mangohud_enabled", 0), d.get("rating", 0),
                   game["id"]))
             con.commit()
             con.close()
@@ -17703,7 +18042,8 @@ class LibraryPage(QWidget):
                 "ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, "
                 "hdr_enabled, fsr4_upgrade, optiscaler_dll, "
                 "use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, "
-                "legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at "
+                "legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, "
+                "mangohud_enabled, rating "
                 "FROM games WHERE id=?",
                 (gid,)).fetchone()
             # Always archive on delete — captures prefix path even if never played
@@ -17722,6 +18062,8 @@ class LibraryPage(QWidget):
                     row[22] or 0, row[23] or 0, row[24] or 0, row[25] or 0, row[26] or 0, row[27] or 0,
                     row[28] or 0, row[29] or "default", row[30] or 0)
                 _added_at_orig = row[31] or ""
+                _mangohud      = row[32] or 0
+                _rating        = row[33] or 0
                 _exe_filename = Path(_exe).name if _exe else ""
                 # store_key must be a unique identifier per game:
                 #   Steam  → AppID (exe_path); umu_store is just "steam", useless as key
@@ -17762,16 +18104,18 @@ class LibraryPage(QWidget):
                              ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model,
                              hdr_enabled, fsr4_upgrade, optiscaler_dll,
                              use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync,
-                             legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names)
+                             legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names,
+                             mangohud_enabled, rating)
                         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?,
                                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (_exe_filename, _gtype, _store_key, _name, _pt, _ls, _lp or "", _pfx_path,
                           _launch_args, _env_vars, _pre_cmd, _post_cmd, _auto_backup,
                           _ludusavi_title, _gamescope, _upscale, _upscale_model,
                           _hdr, _fsr4, _optiscaler,
                           _wined3d, _wow64, _wayland, _no_esync, _no_fsync, _no_ntsync,
-                          _legacy_mc, _video_decode, _vn_jp, _added_at_orig, _cat_names))
+                          _legacy_mc, _video_decode, _vn_jp, _added_at_orig, _cat_names,
+                          _mangohud, _rating))
             con.execute("DELETE FROM games WHERE id=?", (gid,))
             con.commit()
             con.close()
@@ -20310,7 +20654,8 @@ class MainWindow(QMainWindow):
                     # Steam: keyed by AppID (store_key) — silent full restore
                     arc = con.execute("""
                         SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
-                               launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
+                               launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names,
+                               mangohud_enabled, rating
                         FROM playtime_archive
                         WHERE game_type='steam' AND store_key=?
                         ORDER BY archived_at DESC LIMIT 1
@@ -20318,9 +20663,9 @@ class MainWindow(QMainWindow):
                     if arc:
                         con.execute(
                             "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
-                            "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                            "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, mangohud_enabled=?, rating=? WHERE id=?",
                             (arc[2], arc[3], arc[4],
-                             arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                             arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[28], arc[29],
                              new_id))
                         con.commit()
                         self._set_status(f"Restored playtime and settings for {_gname}")
@@ -20340,7 +20685,8 @@ class MainWindow(QMainWindow):
                     if _gog_id_restore:
                         arc = con.execute("""
                             SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
-                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
+                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names,
+                                   mangohud_enabled, rating
                             FROM playtime_archive
                             WHERE game_type=? AND store_key=? AND store_key != ''
                             ORDER BY archived_at DESC LIMIT 1
@@ -20348,9 +20694,9 @@ class MainWindow(QMainWindow):
                         if arc:
                             con.execute(
                                 "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
-                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, mangohud_enabled=?, rating=? WHERE id=?",
                                 (arc[2], arc[3], arc[4],
-                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[28], arc[29],
                                  new_id))
                             con.commit()
                             self._set_status(f"Restored playtime and settings for {_gname}")
@@ -20372,7 +20718,8 @@ class MainWindow(QMainWindow):
                     if _exe_filename:
                         arc = con.execute("""
                             SELECT id, game_name, playtime_minutes, last_session_minutes, last_played,
-                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names
+                                   launch_args, env_vars, pre_launch_cmd, post_exit_cmd, auto_backup, ludusavi_title, gamescope_enabled, upscale_enabled, upscale_model, hdr_enabled, fsr4_upgrade, optiscaler_dll, use_wined3d, use_wow64, use_wayland, no_esync, no_fsync, no_ntsync, legacy_mediaconv, video_decode_mode, vn_jp_locale, added_at, category_names,
+                                   mangohud_enabled, rating
                             FROM playtime_archive
                             WHERE exe_filename=? AND game_type=?
                             ORDER BY archived_at DESC LIMIT 1
@@ -20382,9 +20729,9 @@ class MainWindow(QMainWindow):
                             # Only the prefix conflict (handled below) prompts the user.
                             con.execute(
                                 "UPDATE games SET playtime_minutes=?, last_session_minutes=?, last_played=?, "
-                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, added_at=? WHERE id=?",
+                                "launch_args=?, env_vars=?, pre_launch_cmd=?, post_exit_cmd=?, auto_backup=?, ludusavi_title=?, gamescope_enabled=?, upscale_enabled=?, upscale_model=?, hdr_enabled=?, fsr4_upgrade=?, optiscaler_dll=?, use_wined3d=?, use_wow64=?, use_wayland=?, no_esync=?, no_fsync=?, no_ntsync=?, legacy_mediaconv=?, video_decode_mode=?, vn_jp_locale=?, mangohud_enabled=?, rating=? WHERE id=?",
                                 (arc[2], arc[3], arc[4],
-                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[26],
+                                 arc[5], arc[6], arc[7], arc[8], arc[9], arc[10], arc[11], arc[12], arc[13], arc[14], arc[15], arc[16], arc[17], arc[18], arc[19], arc[20], arc[21], arc[22], arc[23], arc[24], arc[25], arc[28], arc[29],
                                  new_id))
                             con.commit()
                             self._set_status(f"Restored playtime and settings for {_gname}")

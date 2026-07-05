@@ -799,10 +799,6 @@ QLabel#runningDot {
 QLabel#playtimeBadge {
     background: rgba(10,10,14,0.70);
     color: #e4e4e7;
-    font-size: 12px;
-    font-weight: 600;
-    padding: 3px 7px;
-    border-radius: 5px;
 }
 
 /* ── Dialog card stats ── */
