@@ -5,7 +5,7 @@ QMainWindow, QWidget#root {
 }
 QWidget {
     color: __T_TEXT__;
-    font-family: 'Segoe UI', 'Ubuntu', 'Noto Sans', sans-serif;
+    font-family: 'Inter', 'Noto Sans', sans-serif;
     font-size: 14px;
 }
 
@@ -192,19 +192,34 @@ QWidget#topbar {
     border-top-right-radius: 10px;
 }
 
+/* ── Placeholder text — global, all input types ──
+   QSS `color:` rules override the QPalette PlaceholderText role (Qt derives
+   the placeholder from the stylesheet color at 50% alpha), so the faded
+   color must be set here via placeholder-text-color (Qt 6.5+). One global
+   rule covers every current and future input. The manually-painted
+   QTextEdit#dlgNameInput reads the palette role, kept in sync in
+   _apply_palette with the same hex as this token. */
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
+    placeholder-text-color: __T_PLACEHOLDER__;
+}
+
 /* ── Search ── */
 QLineEdit#search {
-    background: __T_SURFACE__;
+    background: __T_SURFACE2__;
     border: 1px solid __T_BORDER2__;
     border-radius: 8px;
     padding: 7px 14px;
     color: __T_TEXT__;
     font-size: 14px;
     selection-background-color: __ACCENT__;
+    /* Stronger than the global faded placeholder — the search hint is
+       functional signage, not just a format example. More specific
+       selector wins over the global QLineEdit rule. */
+    placeholder-text-color: __T_PLACEHOLDER_HI__;
 }
 QLineEdit#search:focus {
     border: 1px solid __ACCENT__;
-    background: __T_SURFACE_HOVER__;
+    background: __T_SURFACE2__;
 }
 
 /* ── Buttons ── */
@@ -283,7 +298,7 @@ QPushButton#secondary:checked {
 }
 QPushButton#secondary:disabled {
     background: __T_DISABLED_BG__;
-    color: __T_TEXT6__;
+    color: __T_TEXT_DISABLED__;
     border-color: __T_BORDER2__;
 }
 QPushButton#primary:disabled {
@@ -435,6 +450,17 @@ QLineEdit#dlgInput:focus, QComboBox#dlgCombo:focus {
     border-color: __ACCENT__;
     background: __T_SURFACE2__;
 }
+/* Combos respond on hover (text inputs don't) — part of what makes them read
+   as selectors rather than fields. Placed before the :disabled block below so
+   disabled styling still wins. */
+QComboBox#dlgCombo:hover {
+    border-color: __T_COMBO_BORDER__;
+}
+/* While the custom popup is open — accent border, paired with the flipped
+   accent chevron painted by NAGOComboBox. Property set in _set_open(). */
+QComboBox#dlgCombo[comboOpen="true"] {
+    border-color: __ACCENT__;
+}
 QPushButton#envDelBtn {
     background: transparent;
     color: __T_TEXT4__;
@@ -468,7 +494,7 @@ QWidget#envGridRow:last-child {
 QComboBox#dlgCombo:disabled,
 QLineEdit#dlgInput:disabled,
 QLineEdit#dlgInputMono:disabled {
-    color: __T_TEXT6__;
+    color: __T_TEXT_DISABLED__;
     background: __T_SIDEBAR_BG__;
     border-color: __T_BORDER3__;
 }
@@ -565,7 +591,7 @@ QCheckBox::indicator:disabled {
     border-color: __T_BORDER3__;
     background: __T_SIDEBAR_BG__;
 }
-QCheckBox:disabled { color: __T_TEXT6__; }
+QCheckBox:disabled { color: __T_TEXT_DISABLED__; }
 QLabel#statusBar {
     color: __T_TEXT6__;
     font-size: 14px;
@@ -721,6 +747,11 @@ QLabel#fieldHintSm {
     font-size: 12px;
     background: transparent;
 }
+QLabel#bkInfo {
+    color: __T_TEXT3__;
+    font-size: 13px;
+    background: transparent;
+}
 QLabel#mutedHint {
     color: __T_MUTED__;
     font-size: 12px;
@@ -745,7 +776,7 @@ QToolTip {
     border: 1px solid __T_BORDER__;
     padding: 5px 8px;
     font-size: 14px;
-    font-family: 'Segoe UI', 'Ubuntu', 'Noto Sans', sans-serif;
+    font-family: 'Inter', 'Noto Sans', sans-serif;
 }
 
 /* ── Topbar page title ── */
@@ -799,6 +830,10 @@ QLabel#runningDot {
 QLabel#playtimeBadge {
     background: rgba(10,10,14,0.70);
     color: #e4e4e7;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 7px;
+    border-radius: 5px;
 }
 
 /* ── Dialog card stats ── */
@@ -842,22 +877,22 @@ QFrame#runnerSegFrame {
 /* ── Combo popup items ── */
 QLabel#comboItemNormal {
     color: __T_TEXT__;
-    font-size: 13px;
+    font-size: 14px;
     background: transparent;
 }
 QLabel#comboItemCurrent {
-    font-size: 13px;
+    font-size: 14px;
     background: transparent;
     /* color set inline — needs accent value */
 }
 QLabel#comboItemDisabled {
     color: __T_TEXT6__;
-    font-size: 13px;
+    font-size: 14px;
     background: transparent;
 }
 QLabel#comboItemHighlight {
     color: __T_TEXT__;
-    font-size: 13px;
+    font-size: 14px;
     background: __T_HOVER2__;
     border-radius: 6px;
     margin: 0 4px;
@@ -983,7 +1018,7 @@ QPushButton#compatBtn:hover {
     border-color: __T_TEXT6__;
 }
 QPushButton#compatBtn:disabled {
-    color: __T_TEXT6__;
+    color: __T_TEXT_DISABLED__;
     border-color: __T_BORDER3__;
 }
 

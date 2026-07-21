@@ -6,7 +6,6 @@ native Linux game support, and Windows game support via Proton.
 
 import sys
 import os
-import gc
 import signal
 import platform
 import datetime
@@ -115,8 +114,13 @@ sys.excepthook = _safe_excepthook
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_NAME = "NAGO"
-VERSION  = "1.0.0"
-BUILD    = "01-07-2026 06:10"
+VERSION  = "1.0.1"
+BUILD    = "21-07-2026 22:35"
+
+# Quit-path refcount pin: _run_app() parks (app, win) here so QApplication is
+# never deallocated (SIP 13.11 + Py3.14 SEGVs during that dealloc). See the
+# comment at the tail of _run_app(). Never assign None to this.
+_PINNED_QT_ROOTS = None
 
 # Locale-safe date helpers — always English month abbreviations regardless of system locale.
 _MONTH_ABBR = ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
@@ -223,15 +227,24 @@ def _nago_asset(*parts: str) -> Path:
     return script_path  # not found — return script-relative for error messages
 
 
-# Phosphor icon font — bundled alongside nago-launcher.py
-# MIT License © 2023 Phosphor Icons — see https://github.com/phosphor-icons/core
-_PHOSPHOR_TTF = _nago_asset("icons", "Phosphor.ttf")
+# Bundled asset files — all live in assets/ next to nago-launcher.py (or under
+# NAGO_HOME when installed): fonts + the QSS stylesheet. Icons (logo, svgs)
+# stay in icons/.
+# Phosphor icon font — MIT License © 2023 Phosphor Icons —
+# see https://github.com/phosphor-icons/core
+_PHOSPHOR_TTF = _nago_asset("assets", "Phosphor.ttf")
 # Phosphor Fill weight, subsetted to just the star glyphs (star, star-half).
 # Separate file because in Phosphor the solid/outline distinction is a weight,
 # not a codepoint — the Regular file above has no filled star. Used to paint
 # the filled portion of rating stars; the Regular file paints the empty outline.
-_PHOSPHOR_FILL_TTF = _nago_asset("icons", "Phosphor-Fill-stars.ttf")
+_PHOSPHOR_FILL_TTF = _nago_asset("assets", "Phosphor-Fill-stars.ttf")
 LOGO_PATH     = _nago_asset("icons", "nago-logo.png")
+# Inter UI font — bundled so NAGO renders identically on every machine
+# instead of falling through a per-distro sans-serif stack.
+# SIL OFL 1.1 © The Inter Project Authors — see assets/OFL-Inter.txt
+_INTER_REG_TTF = _nago_asset("assets", "Inter-Regular.ttf")
+_INTER_MED_TTF = _nago_asset("assets", "Inter-Medium.ttf")
+_INTER_LOADED  = False        # set by _load_inter_font()
 _PHOSPHOR_FONT_ID = -1        # QFontDatabase id, populated in _load_phosphor_font()
 _PHOSPHOR_FILL_FONT_ID = -1   # QFontDatabase id for the Fill-weight star subset
 
@@ -244,6 +257,8 @@ PH = {
     "sliders":                  0x0E432,
     "list":                     0x0E2F0,
     "app-window":               0x0E5DA,
+    "globe":                    0x0E288,
+    "caret-right":              0x0E13A,
     "dots-three-vertical":      0x0E208,
     # ── Files / Data ──────────────────────────────────────────────────────────
     "file-archive":             0x0EB2A,
@@ -315,13 +330,85 @@ PH = {
 
 
 # ── NAGO styled message box ────────────────────────────────────────────────────
+class _ScrimOverlay(QWidget):
+    """Semi-transparent dim layer painted over a dialog's parent window so the
+    foreground dialog reads as clearly separated from what's behind it.
+
+    Created per open _NAGODialog and torn down when the dialog closes. Nesting
+    works for free: a dialog opened over another dialog dims that dialog, which
+    is itself already dimming the window behind it — so main -> Edit -> Restore
+    each visibly recedes instead of blending into one dark mass.
+
+    When the host is itself a _NAGODialog, the caller insets this overlay by the
+    host's shadow margin and passes that body radius, so the fill lands only on
+    the solid rounded panel and never paints over (and hard-cuts) the host's
+    soft drop-shadow. Full-screen hosts (the main window) use a plain rect."""
+
+    def __init__(self, host, alpha, radius=0):
+        super().__init__(host)
+        self._alpha  = alpha
+        self._radius = radius
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        col = QColor(0, 0, 0, self._alpha)
+        if self._radius > 0:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(self.rect()), self._radius, self._radius)
+        else:
+            p.fillRect(self.rect(), col)
+        p.end()
+
+
 class _NAGODialog(QDialog):
     """Base class for all NAGO dialogs — adds a painted drop shadow and dragging."""
     _SHADOW = 12
+    _SCRIM_ALPHA = 128            # ~50% black behind the dialog; tune here
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._drag_pos = None
+        self._scrim = None
+
+    def _show_scrim(self):
+        """Dim the parent window while this dialog is open. No-op without a
+        parent (nothing to dim). Idempotent.
+
+        Over a _NAGODialog host, inset by the host's shadow margin and round to
+        the body radius so the fill sits only on the solid panel — never over
+        the host's soft drop-shadow, which a full-rect flat fill would hard-cut."""
+        if self._scrim is not None:
+            return
+        par  = self.parent()
+        host = par.window() if par is not None else None
+        if host is None:
+            return
+        if isinstance(host, _NAGODialog):
+            s      = host._SHADOW
+            rect   = host.rect().adjusted(s, s, -s, -s)
+            radius = 12                      # matches #dialogRoot border-radius
+        else:
+            rect   = host.rect()
+            radius = 0
+        scrim = _ScrimOverlay(host, self._SCRIM_ALPHA, radius)
+        scrim.setGeometry(rect)
+        scrim.raise_()
+        scrim.show()
+        self._scrim = scrim
+
+    def _hide_scrim(self):
+        if self._scrim is None:
+            return
+        try:
+            self._scrim.hide()
+            self._scrim.deleteLater()
+        except Exception:
+            pass
+        self._scrim = None
 
     def exec(self):
         """Run the modal loop, then schedule self-destruction.
@@ -335,8 +422,17 @@ class _NAGODialog(QDialog):
         inline so that the caller's synchronous post-exec reads (result_data,
         result_label(), selected_ids(), etc.) still see a live object — those
         run before the event loop gets a chance to process the deletion.
+
+        The scrim is shown/torn down around the modal loop here rather than in
+        showEvent, because some subclasses (GameDialog, CoverPickerDialog)
+        override showEvent without chaining super(); exec() is defined only on
+        this base and is the reliable hook for every modal NAGO dialog.
         """
-        result = super().exec()
+        self._show_scrim()
+        try:
+            result = super().exec()
+        finally:
+            self._hide_scrim()
         QTimer.singleShot(0, self.deleteLater)
         return result
 
@@ -586,8 +682,8 @@ class NAGOStyle(QProxyStyle):
 
             if not enabled:
                 _theme = _current_theme()
-                bg     = QColor("#f0f0f4") if _theme == "light" else QColor("#2a2a30")
-                border = QColor("#d4d4d8") if _theme == "light" else QColor("#3d3d42")
+                bg     = QColor("#dcdce2") if _theme == "light" else QColor("#2a2a30")
+                border = QColor("#d2d2d9") if _theme == "light" else QColor("#3d3d42")
             elif checked or indeterminate:
                 app    = QApplication.instance()
                 accent = (app.property("nagoAccent") or "#6366f1") if app else "#6366f1"
@@ -622,9 +718,333 @@ class NAGOStyle(QProxyStyle):
         super().drawPrimitive(element, option, painter, widget)
 
     def styleHint(self, hint, option=None, widget=None, returnData=None):
+        # LOAD-BEARING for the custom tooltips: Qt's internal tooltip
+        # scheduler uses this hint to decide when to deliver QEvent.ToolTip
+        # itself (and handles the warm/asleep instant-reshow window via
+        # SH_ToolTip_FallAsleepDelay, default 2s). NAGOToolTipFilter shows
+        # immediately on event receipt, so this value IS the tooltip delay.
         if hint == QStyle.StyleHint.SH_ToolTip_WakeUpDelay:
             return 400
+        # Snappy submenu behavior. Base styles (esp. KDE/Breeze-influenced
+        # setups) use sloppy-close timeouts up to ~1s so diagonal travel
+        # toward a submenu doesn't close it — on NAGO's compact context
+        # menus that reads as lag when hovering away. 100ms keeps close-on-
+        # hover-away near-instant; the popup delay match keeps open equally
+        # quick. Trade-off: very fast diagonal travel into a submenu can
+        # occasionally close it mid-flight.
+        if hint == QStyle.StyleHint.SH_Menu_SubMenuSloppyCloseTimeout:
+            return 100
+        if hint == QStyle.StyleHint.SH_Menu_SubMenuPopupDelay:
+            return 100
         return super().styleHint(hint, option, widget, returnData)
+
+
+class NAGOToolTip(QWidget):
+    """Custom rounded tooltip popup (frameless + translucent).
+
+    Native QToolTip windows are opaque top-levels — QSS border-radius on
+    them paints square corner artifacts, so rounded tooltips require a
+    custom widget, same recipe as the context menus. On Wayland the popup
+    is re-parented to the hovered widget's top-level window on every show
+    so Qt anchors it as a proper xdg_popup instead of guessing a transient
+    parent (verified on KDE Wayland via standalone test, 11-07-2026).
+
+    Colors are read live from DARK_TOKENS/LIGHT_TOKENS at show/paint time,
+    so theme switches need no extra wiring.
+    """
+
+    _MAX_W = 420  # popup max width; label wraps inside
+    _H_PAD = 13   # horizontal layout margin; content budget = _MAX_W - 2*_H_PAD
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.ToolTip
+                         | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._lbl = QLabel(self)
+        self._lbl.setWordWrap(True)
+        # Font set explicitly (NOT via stylesheet) so fontMetrics is reliable
+        # at measure time. Stylesheet fonts aren't applied until polish, so a
+        # width computed from stylesheet-font metrics in show_for would read
+        # the wrong (default) font and mis-wrap.
+        _f = QFont()
+        _f.setFamilies(["Inter", "Noto Sans", "sans-serif"])
+        _f.setPixelSize(14)
+        self._lbl.setFont(_f)
+        _lay = QVBoxLayout(self)
+        _lay.setContentsMargins(self._H_PAD, 9, self._H_PAD, 9)
+        _lay.addWidget(self._lbl)
+
+    def _tokens(self) -> dict:
+        return LIGHT_TOKENS if _current_theme() == "light" else DARK_TOKENS
+
+    def paintEvent(self, ev):
+        _tk = self._tokens()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(_tk["__T_BORDER__"]), 1))
+        p.setBrush(QBrush(QColor(_tk["__T_TOOLTIP_BG__"])))
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+
+    def show_for(self, widget: QWidget, text: str, global_pos: QPoint):
+        # Re-parent to the hovered widget's top-level window so Wayland
+        # gets a real popup anchor. setParent() resets window flags and
+        # attributes — re-apply them.
+        _win = widget.window()
+        if self.parent() is not _win:
+            self.setParent(_win, Qt.WindowType.ToolTip
+                           | Qt.WindowType.FramelessWindowHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        _tk = self._tokens()
+        # Font lives on the label (set in __init__); only color/background
+        # vary by theme, so the stylesheet carries just those.
+        self._lbl.setStyleSheet(
+            f"color: {_tk['__T_TEXT__']}; background: transparent;")
+        # Author-placed single '\n' breaks were sized for a wider popup and
+        # orphan words in this box — flatten them to spaces and let the label
+        # choose its own breaks. Blank-line breaks ('\n\n') stay as intentional
+        # hard breaks; runs of spaces (e.g. aligned env-var lists) are kept.
+        _txt = "\n\n".join(_p.replace("\n", " ") for _p in text.split("\n\n"))
+        self._lbl.setText(_txt)
+        # A previous show pinned the label via setFixedWidth (min==max). Clear
+        # that first, or minimumSizeHint/heightForWidth read the stale width
+        # and every later tip inherits the last one's size (single-word tips
+        # were coming out full-width because of this).
+        self._lbl.setMinimumWidth(0)
+        self._lbl.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+        # Size the box to the tightest width that still fits in the MINIMUM
+        # number of lines, using QLabel's OWN layout engine (heightForWidth)
+        # as the single source of truth — no separate metrics pass to disagree
+        # with the render, so no off-by-a-few-pixels orphaning. Floor at the
+        # widest unbreakable word (minimumSizeHint) so single-word tips don't
+        # collapse toward 1px. Result: balanced, gap-free wrapping.
+        _budget = self._MAX_W - 2 * self._H_PAD
+        _h_full = self._lbl.heightForWidth(_budget)
+        _lo = max(1, self._lbl.minimumSizeHint().width())
+        _hi = _budget
+        _best = _budget
+        while _lo <= _hi:
+            _mid = (_lo + _hi) // 2
+            if self._lbl.heightForWidth(_mid) <= _h_full:
+                _best = _mid
+                _hi = _mid - 1
+            else:
+                _lo = _mid + 1
+        self._lbl.setFixedWidth(_best)
+        self.adjustSize()
+        # Native-style offset: below-right of the cursor, clamped on-screen.
+        _pos = global_pos + QPoint(2, 18)
+        _scr = (widget.screen() or QApplication.primaryScreen()).availableGeometry()
+        if _pos.x() + self.width() > _scr.right():
+            _pos.setX(_scr.right() - self.width())
+        if _pos.y() + self.height() > _scr.bottom():
+            _pos.setY(global_pos.y() - self.height() - 2)
+        self.move(_pos)
+        self.show()
+
+
+class NAGOToolTipFilter(QObject):
+    """App-wide event filter that replaces native QToolTip with NAGOToolTip.
+
+    Shows the custom popup IMMEDIATELY on QEvent.ToolTip. No timer here:
+    Qt's internal tooltip scheduler already delays event delivery by
+    SH_ToolTip_WakeUpDelay (400ms, set in NAGOStyle) and handles the
+    warm/asleep instant-reshow window (SH_ToolTip_FallAsleepDelay, 2s
+    default). A previous build stacked its own 250ms timer + 1.5s warm
+    window on top of Qt's — mismatched schedulers made delays swing
+    between ~0/250/650ms. Never re-add a delay in this filter.
+
+    Empty-text ToolTip events return False so Qt's child→parent help-event
+    propagation keeps working: NAGO sets tooltips on container widgets
+    (e.g. stat rows) whose children have none — returning True there would
+    swallow the event before it reaches the tooltip-bearing ancestor.
+
+    Once visible, further ToolTip events for the same widget are ignored
+    (native tooltips stay planted; repositioning per-event made the tip
+    chase the cursor). Hides on: owner Leave/Hide, and any mouse press /
+    wheel / key press / window deactivate app-wide.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        # The tip is created lazily and may be recreated: show_for()
+        # re-parents it to the hovered widget's top-level window (Wayland
+        # popup anchoring), which transfers Qt OWNERSHIP. When that window
+        # is destroyed (any dialog closing), Qt deletes the tip with it —
+        # the Python wrapper then points at a dead C++ object. All access
+        # goes through _tip_widget(), which detects deletion and rebuilds.
+        self._tip = None
+        self._owner = None     # widget the visible tip belongs to
+
+    def _tip_widget(self):
+        from PyQt6 import sip as _sip
+        if self._tip is None or _sip.isdeleted(self._tip):
+            self._tip = NAGOToolTip()
+        return self._tip
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.ToolTip and isinstance(obj, QWidget):
+            text = obj.toolTip()
+            if not text:
+                return False  # let Qt propagate to a tooltip-bearing parent
+            tip = self._tip_widget()
+            if self._owner is obj and tip.isVisible():
+                return True   # already showing for this widget — stay put
+            tip.show_for(obj, text, ev.globalPos())
+            self._owner = obj
+            return True       # suppress the native tooltip
+        if t in (QEvent.Type.MouseButtonPress,
+                 QEvent.Type.Wheel,
+                 QEvent.Type.KeyPress,
+                 QEvent.Type.WindowDeactivate):
+            self._hide()
+        elif t in (QEvent.Type.Leave, QEvent.Type.Hide):
+            if obj is self._owner:
+                self._hide()
+        return False
+
+    def _hide(self):
+        self._owner = None
+        tip = self._tip
+        if tip is None:
+            return
+        from PyQt6 import sip as _sip
+        if _sip.isdeleted(tip):
+            self._tip = None   # host window destroyed the tip with itself
+            return
+        if tip.isVisible():
+            tip.hide()
+        # Detach from the host window while idle. show_for() re-parents the
+        # tip into the hovered widget's top-level (Wayland popup anchoring),
+        # which transfers Qt OWNERSHIP — leaving it parented means any dialog
+        # closing deletes the tip's C++ side, and the stale-wrapper churn
+        # that follows corrupts SIP's registry walk during QApplication
+        # release (SEGV at `del app`, field crash 11-07-2026). Re-parenting
+        # to None on every hide shrinks the ownership window to only while
+        # the tip is visible. setParent() resets flags/attributes — re-apply
+        # (show_for() does the same on its side).
+        if tip.parent() is not None:
+            tip.setParent(None, Qt.WindowType.ToolTip
+                          | Qt.WindowType.FramelessWindowHint)
+            tip.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            tip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+    def dispose(self):
+        """Quit-path cleanup: delete the tip while the world is orderly.
+
+        Called from _run_app() teardown (after app.exec() returns, before
+        `del win`) so no tooltip wrapper — live or dead — remains registered
+        when SIP walks its wrapper registry during QApplication release.
+        """
+        self._owner = None
+        tip = self._tip
+        self._tip = None
+        if tip is None:
+            return
+        from PyQt6 import sip as _sip
+        if not _sip.isdeleted(tip):
+            _sip.delete(tip)
+
+
+class NAGOSmoothScroller(QObject):
+    """Smooth mouse-wheel scrolling for a QScrollArea.
+
+    Event filter on the scroll area's viewport. Intercepts wheel events
+    that carry only angleDelta (physical mouse wheels) and glides the
+    vertical scrollbar to the target with a short OutSine animation
+    (_DURATION_MS).
+
+    Deliberately NOT smoothed:
+    - Touchpad input (non-null pixelDelta): already pixel-smooth on
+      Wayland — animating it would double-smooth into floaty lag.
+    - Scrolling while `blocked()` is True (card drag active): the grid's
+      drag auto-scroll timer writes the scrollbar directly; two writers
+      on one scrollbar jitter. Native instant wheel applies instead.
+
+    Per-tick distance matches Qt's native wheel math
+    (wheelScrollLines × singleStep per 120 units) — this changes only
+    smoothness, never scroll speed. A float accumulator keeps hi-res
+    wheels (angleDelta < 120 per event) from losing sub-step remainders.
+
+    Consecutive ticks retarget the running animation from the current
+    position (endValue-based accumulation), so fast flicks merge into
+    one longer glide instead of queueing.
+
+    `on_glide_changed(bool)` fires True when a glide starts and False
+    when it finishes or is cancelled — the grid uses it to suppress
+    card hover churn while content sweeps under the cursor.
+    """
+
+    _DURATION_MS = 95    # glide settle time; 150→110→85→95, tuned on hardware
+
+    def __init__(self, scroll_area, blocked=None, on_glide_changed=None):
+        super().__init__(scroll_area)
+        self._sa = scroll_area
+        self._blocked = blocked or (lambda: False)
+        self._on_glide = on_glide_changed or (lambda on: None)
+        self._acc = 0.0          # sub-step remainder for hi-res wheels
+        self._gliding = False
+        # Settings → Advanced → Behavior → "Smooth scrolling". Checked at
+        # every wheel event so the Save-Settings apply path can flip it
+        # without rebuilding anything. When False, wheels take Qt's native
+        # instant path.
+        self.enabled = True
+        bar = scroll_area.verticalScrollBar()
+        self._anim = QPropertyAnimation(bar, b"value", self)
+        self._anim.setDuration(self._DURATION_MS)
+        # OutSine — gentlest of the Out curves. History: OutCubic felt
+        # heavy at 110ms; OutQuad (tried 18-07) felt worse; OutCubic@85
+        # felt twitchy. OutSine@95 = soft settle without the Cubic tail.
+        self._anim.setEasingCurve(QEasingCurve.Type.OutSine)
+        self._anim.finished.connect(self._on_finished)
+        scroll_area.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.Wheel:
+            return False
+        if not self.enabled:
+            return False          # feature off — native instant scroll
+        if not ev.pixelDelta().isNull():
+            return False          # touchpad — native pixel-smooth path
+        dy = ev.angleDelta().y()
+        if dy == 0:
+            return False          # horizontal wheel — not ours
+        if self._blocked():
+            self.cancel()
+            return False          # drag active — native instant scroll
+        bar = self._sa.verticalScrollBar()
+        step = QApplication.wheelScrollLines() * max(1, bar.singleStep())
+        self._acc += -dy * step / 120.0
+        move = int(self._acc)
+        self._acc -= move
+        base = (self._anim.endValue()
+                if self._anim.state() == QPropertyAnimation.State.Running
+                else bar.value())
+        target = max(bar.minimum(), min(bar.maximum(), base + move))
+        if target == bar.value():
+            return True
+        self._anim.stop()
+        self._anim.setStartValue(bar.value())
+        self._anim.setEndValue(target)
+        if not self._gliding:
+            self._gliding = True
+            self._on_glide(True)
+        self._anim.start()
+        return True
+
+    def cancel(self):
+        """Stop any in-flight glide immediately (called on drag start)."""
+        if self._anim.state() == QPropertyAnimation.State.Running:
+            self._anim.stop()
+        self._acc = 0.0
+        self._on_finished()
+
+    def _on_finished(self):
+        if self._gliding:
+            self._gliding = False
+            self._on_glide(False)
 
 
 class NAGOCheckBox(QWidget):
@@ -717,8 +1137,8 @@ class NAGOCheckBox(QWidget):
         # Background & border
         if not self.isEnabled():
             _theme = _current_theme()
-            bg     = QColor("#1e1e22") if _theme == "dark" else QColor("#f0f0f4")
-            border = QColor("#2a2a2f") if _theme == "dark" else QColor("#d4d4d8")
+            bg     = QColor("#1e1e22") if _theme == "dark" else QColor("#dcdce2")
+            border = QColor("#2a2a2f") if _theme == "dark" else QColor("#d2d2d9")
         elif self._checked:
             bg     = QColor(accent2) if self._hovered else QColor(accent)
             border = bg
@@ -737,7 +1157,13 @@ class NAGOCheckBox(QWidget):
 
         # Checkmark
         if self._checked:
-            ck_color = QColor("#71717a") if not self.isEnabled() else QColor("#ffffff")
+            if not self.isEnabled():
+                # Faded, theme-aware — visible enough to read the checked
+                # state, dim enough to look inert (was a too-bright #71717a).
+                ck_color = (QColor("#b0b0ba") if _current_theme() == "light"
+                            else QColor("#4a4a52"))
+            else:
+                ck_color = QColor("#ffffff")
             pen = QPen(ck_color, 2.0)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -759,7 +1185,10 @@ class NAGOCheckBox(QWidget):
             lx = self._box + self._spacing
             _theme = _current_theme()
             if not self.isEnabled():
-                color = QColor("#a1a1aa") if _theme == "light" else QColor("#71717a")
+                # Matches __T_TEXT_DISABLED__ (kept in sync manually — this
+                # painter can't read QSS tokens) so custom checkboxes fade
+                # identically to every stylesheet-disabled control.
+                color = QColor("#c6c6ce") if _theme == "light" else QColor("#3d3d44")
             else:
                 color = QColor("#18181b") if _theme == "light" else QColor("#e4e4e7")
             p.setPen(color)
@@ -791,6 +1220,32 @@ def _load_phosphor_font():
                   file=sys.stderr)
 
 
+def _load_inter_font():
+    """Register the bundled Inter TTFs (UI font). Safe to call multiple times.
+    If the files are missing, silently falls back to the QSS stack's
+    'Noto Sans' — the app still runs, just renders with the system sans."""
+    global _INTER_LOADED
+    if _INTER_LOADED or QApplication.instance() is None:
+        return
+    from PyQt6.QtGui import QFontDatabase
+    ok = False
+    for ttf in (_INTER_REG_TTF, _INTER_MED_TTF):
+        if ttf.exists():
+            if QFontDatabase.addApplicationFont(str(ttf)) != -1:
+                ok = True
+            else:
+                print(f"[NAGO] Warning: failed to load Inter font from {ttf}",
+                      file=sys.stderr)
+    if ok:
+        _INTER_LOADED = True
+        # Painted text (QPainter with self.font()/QFont()) reads the app
+        # default font, not QSS — retarget its family, preserving size.
+        app = QApplication.instance()
+        f = app.font()
+        f.setFamily("Inter")
+        app.setFont(f)
+
+
 def _ph_family() -> str:
     """Return the loaded Phosphor font family name, or empty string."""
     from PyQt6.QtGui import QFontDatabase
@@ -811,8 +1266,28 @@ def _ph_fill_family() -> str:
     return ""
 
 
+# Default icon colors, resolved per-theme at call time. Icons bake their color
+# into a pixmap at construction, so a live theme switch leaves them stale until
+# the app restarts — accepted: theme changes go through Save Settings and land
+# fully on next launch.
+_ICON_DEFAULT_DARK  = "#c8c8d0"   # lighter than body-muted text, short of white
+_ICON_DEFAULT_LIGHT = "#52525b"   # dark gray — light theme needs darker, not lighter
+
+def ph_icon(name: str, size: int = 16, color: str | None = None) -> QIcon:
+    """
+    Render a Phosphor icon glyph into a QIcon.
+    color=None resolves the theme-appropriate default at call time — this
+    wrapper stays uncached so the resolved color (not None) forms the cache
+    key; otherwise the first theme to render would poison the cache.
+    """
+    if color is None:
+        color = (_ICON_DEFAULT_DARK if _current_theme() == "dark"
+                 else _ICON_DEFAULT_LIGHT)
+    return _ph_icon_render(name, size, color)
+
+
 @functools.lru_cache(maxsize=256)
-def ph_icon(name: str, size: int = 16, color: str = "#a1a1aa") -> QIcon:
+def _ph_icon_render(name: str, size: int, color: str) -> QIcon:
     """
     Render a Phosphor icon glyph into a QIcon by painting it onto a QPixmap.
     Lazy-loads the font on first call so call order doesn't matter.
@@ -865,7 +1340,7 @@ def ph_icon(name: str, size: int = 16, color: str = "#a1a1aa") -> QIcon:
     return icon
 
 
-def ph_label(name: str, size: int = 16, color: str = "#a1a1aa") -> QLabel:
+def ph_label(name: str, size: int = 16, color: str | None = None) -> QLabel:
     """
     Return a QLabel showing a single Phosphor icon glyph as a pixmap.
     Safe against stylesheet font-family overrides.
@@ -946,7 +1421,7 @@ def store_icon(name: str, size: int = 16, color: str = "#ffffff") -> QIcon:
 
 
 @functools.lru_cache(maxsize=64)
-def _spinner_icon(angle: int, size: int = 22, color: str = "#a1a1aa") -> QIcon:
+def _spinner_icon(angle: int, size: int = 22, color: str = "#c8c8d0") -> QIcon:
     """Render the circle-notch glyph rotated by `angle` degrees.
     Cached per (angle, size, color) — only 12 distinct angles at 30° steps,
     so the cache stays tiny and each frame is rendered at most once."""
@@ -986,9 +1461,14 @@ class _ButtonSpinner:
         ... background work ...
         spin.stop()           # original icon restored
     """
-    def __init__(self, button, size: int = 22, color: str = "#a1a1aa"):
+    def __init__(self, button, size: int = 22, color: str | None = None):
         self._btn   = button
         self._size  = size
+        # Resolve the theme default here (uncached) — _spinner_icon is
+        # lru_cached, so it must always receive a concrete color.
+        if color is None:
+            color = (_ICON_DEFAULT_DARK if _current_theme() == "dark"
+                     else _ICON_DEFAULT_LIGHT)
         self._color = color
         self._angle = 0
         self._orig_icon = None
@@ -1021,7 +1501,7 @@ class _ButtonSpinner:
             self._orig_icon = None
 
 
-CARD_W = 185
+CARD_W = 180
 COVER_H = CARD_W * 3 // 2   # true 2:3 ratio, no clipping ever
 CARD_H = COVER_H              # no strip — name lives inside cover over gradient
 CARD_RADIUS  = round(CARD_W * 0.0667)  # ~12px at 175px; scales with card width
@@ -1165,16 +1645,166 @@ def get_prefixes_root() -> Path:
         return Path(os.path.expandvars(os.path.expanduser(custom)))
     return PREFIXES_PATH
 
+# ── Prefix naming & id-anchored resolution ───────────────────────────────────
+# Every game/tool prefix folder is named "<slug><SEP><id>" where SEP is '@'.
+# '@' is filesystem-legal everywhere (incl. FAT/exFAT), needs no shell quoting,
+# and slugify() strips it (only alnum, space, '-', '_' survive), so a title's
+# slug can never contain the separator and thus never collide with the id
+# segment. games.id (INTEGER PRIMARY KEY AUTOINCREMENT — unique, never
+# reused) is the authoritative key; the slug is human-readable only and may go
+# stale after a rename (nothing reads it — resolution uses the stored
+# prefix_path, or for un-pinned legacy rows an id-exact folder match).
+PREFIX_ID_SEP = "@"
+
+
+def derive_prefix_path(name: str, game_id) -> Path:
+    """Canonical prefix path for a game/tool: <root>/<slug><SEP><id>. Pure —
+    never creates the directory (unlike get_game_prefix)."""
+    return get_prefixes_root() / f"{slugify(name)}{PREFIX_ID_SEP}{game_id}"
+
+
+def _prefix_folder_id(folder_name: str):
+    """The game id a prefix folder belongs to (as str), or None. Handles the
+    current '<slug><SEP><id>' scheme and the legacy '<slug>_<id>' scheme so
+    pre-separator folders still resolve without any migration."""
+    if PREFIX_ID_SEP in folder_name:
+        tail = folder_name.rsplit(PREFIX_ID_SEP, 1)[-1]
+        return tail if tail.isdigit() else None
+    m = re.search(r"_(\d+)$", folder_name)
+    return m.group(1) if m else None
+
+
+def _prefix_folder_slug(folder_name: str) -> str:
+    """The human-readable slug portion of a prefix folder name, id stripped.
+    Handles both the '<slug><SEP><id>' and legacy '<slug>_<id>' schemes."""
+    if PREFIX_ID_SEP in folder_name:
+        return folder_name.rsplit(PREFIX_ID_SEP, 1)[0]
+    return re.sub(r"_\d+$", "", folder_name)
+
+
+def find_prefix_by_id(game_id) -> "Path | None":
+    """Return the on-disk prefix folder whose id segment equals game_id, or
+    None. Id-exact (not slug-prefix), so 'gog_galaxy<SEP>5' can never match a
+    sibling 'gog_galaxy_2<SEP>6'. Used only to self-heal un-pinned legacy rows."""
+    root = get_prefixes_root()
+    if not root.exists():
+        return None
+    gid_str = str(game_id)
+    try:
+        for entry in root.iterdir():
+            if entry.is_dir() and _prefix_folder_id(entry.name) == gid_str:
+                return entry
+    except Exception:
+        return None
+    return None
+
+
 def get_game_prefix(game_id: int, game_name: str = "") -> Path:
     """
     Return the WINEPREFIX path for a given game id, creating it if needed.
-    Naming is '<GameName>_<id>', e.g. 'Hogwarts_Legacy_3'.
+    Naming is '<slug><SEP><id>' (see PREFIX_ID_SEP).
     """
-    root = get_prefixes_root()
-    slug = slugify(game_name) if game_name else "game"
-    pfx = root / f"{slug}_{game_id}"
+    pfx = derive_prefix_path(game_name, game_id)
     pfx.mkdir(parents=True, exist_ok=True)
     return pfx
+
+
+def resolve_prefix(game: dict, *, persist: bool = True) -> Path:
+    """
+    Resolve a Proton/GOG game's WINEPREFIX path, id-anchored. Never creates the
+    directory. Order:
+      1. A stored prefix_path (custom override OR canonical pin) is honored
+         as-is — even when the folder isn't bootstrapped yet (umu creates it on
+         first launch). Never cleared: with the path pinned there is nothing to
+         re-derive, so the old "missing -> wipe" drift is gone.
+      2. Otherwise an existing on-disk folder matching this id (an un-pinned
+         legacy row) — pinned when persist=True so later reads are direct.
+      3. Otherwise the canonical derived path — pinned when persist=True.
+    persist=False callers (context menu, delete) read without writing.
+    """
+    stored = (game.get("prefix_path") or "").strip()
+    if stored:
+        return Path(stored)
+    gid  = game.get("id")
+    name = game.get("name", "")
+    found = find_prefix_by_id(gid) if gid else None
+    pfx = found if found is not None else derive_prefix_path(name, gid)
+    if persist and gid:
+        try:
+            _con = db_con()
+            _con.execute("UPDATE games SET prefix_path=? WHERE id=?", (str(pfx), gid))
+            _con.commit()
+            _con.close()
+            game["prefix_path"] = str(pfx)
+        except Exception as e:
+            _NAGOLog.session(f"[warn] resolve_prefix: failed to persist prefix_path for game {gid}: {e}")
+    return pfx
+
+
+def find_prefix_references(pfx_str: str, exclude_id: int) -> list:
+    """Every OTHER row (game or tool) whose stored prefix_path equals pfx_str.
+    Equality on the raw column is sufficient and correct: two different rows
+    can only ever resolve to the same folder via an explicit stored override
+    (the dropdown / Browse for Prefix write path) — an un-pinned row's own
+    canonical derived path is always unique to its own id, so it can never
+    coincidentally collide with another row's path. Used both to find who a
+    prefix-sharing tool is really pointing at, and to find who ELSE is
+    pointing at a prefix about to be deleted (the tool-chain case)."""
+    if not pfx_str:
+        return []
+    try:
+        con = db_con()
+        cur = con.execute(
+            "SELECT * FROM games WHERE prefix_path=? AND id!=?",
+            (pfx_str, exclude_id),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        con.close()
+        return rows
+    except Exception as e:
+        _NAGOLog.session(f"[warn] find_prefix_references failed for {pfx_str}: {e}")
+        return []
+
+
+def is_wine_prefix(path) -> bool:
+    """Heuristic: does `path` look like an actual Wine prefix root? A booted
+    prefix always has a drive_c/ directory and a system.reg file. Used to
+    soft-warn (not hard-block) when the user browses for an existing prefix
+    and picks something that's almost certainly not one (e.g. the install
+    folder or a parent dir). Never raises."""
+    try:
+        p = Path(path)
+        return (p / "drive_c").is_dir() and (p / "system.reg").is_file()
+    except Exception:
+        return False
+
+
+def _trash_or_delete_path(path) -> str:
+    """Move `path` to the desktop's real trash (Delete-key equivalent) instead
+    of a hard rmtree — restorable from the user's own file manager, no NAGO
+    trash management needed. Tries gio (DE-agnostic, gvfs); falls back to a
+    genuine hard-delete if gio isn't available. Returns which path was used,
+    for logging: "gio" | "rmtree" | "failed"."""
+    import shutil as _shutil
+    p = str(path)
+    gio_bin = shutil.which("gio")
+    if gio_bin:
+        try:
+            r = subprocess.run([gio_bin, "trash", "-f", p],
+                                capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                return "gio"
+            _NAGOLog.session(f"[trash] gio trash failed ({r.returncode}): {r.stderr.strip()}")
+        except Exception as e:
+            _NAGOLog.session(f"[trash] gio trash raised: {e}")
+    try:
+        _shutil.rmtree(p)
+        _NAGOLog.session(f"[trash] gio unavailable — hard-deleted {p}")
+        return "rmtree"
+    except Exception as e:
+        _NAGOLog.session(f"[trash] hard-delete also failed for {p}: {e}")
+        return "failed"
 
 
 def _gamescope_resolution() -> tuple[int, int, int]:
@@ -1979,7 +2609,8 @@ def _filesystem_share_root(path_str: str) -> str:
 
 def build_umu_env(base_env: dict, *, wineprefix: str, proton_path: str = "",
                   game_id: str = "", store: str = "",
-                  extra_share_paths: "list[str] | None" = None) -> dict:
+                  extra_share_paths: "list[str] | None" = None,
+                  disable_protonfixes: bool = False) -> dict:
     """Populate environment variables for umu-run. Modifies a copy of base_env.
 
     extra_share_paths: host paths actually being launched/touched this run
@@ -1987,6 +2618,21 @@ def build_umu_env(base_env: dict, *, wineprefix: str, proton_path: str = "",
     See _filesystem_share_root for why this matters — without it, umu's
     sandbox can silently fail to see files on a second drive/mount even
     though they're really there.
+
+    disable_protonfixes: set PROTONFIXES_DISABLE=1 (official umu env var) to
+    skip protonfixes' check pass entirely. NAGO never passes a GAMEID
+    (protonfix system disabled — Option A), so the pass applies nothing yet
+    still runs 2-3x per session (prefix setup, game run, teardown), popping
+    the "Installing Game-specific fixes, please wait…" kdialog each time and
+    risking a network stall on its umu-database lookup. Pure overhead — skip
+    it for exe-running paths (game launch, installer run, Run in Prefix).
+    NEVER set this for winetricks/winecfg (_get_prefix_tool_env): umu's
+    winetricks integration is IMPLEMENTED BY protonfixes and dies with it.
+    If the protonfix system is ever re-enabled (Option A reversal), lift
+    this flag at the same time or per-game fixes will silently not apply.
+    Per-game env_vars are merged AFTER this env at every call site, so a
+    user-set PROTONFIXES_DISABLE=0 in a game's env field wins as an
+    escape hatch.
     """
     env = dict(base_env)
     env["WINEPREFIX"] = wineprefix
@@ -1999,6 +2645,8 @@ def build_umu_env(base_env: dict, *, wineprefix: str, proton_path: str = "",
         env["GAMEID"] = game_id
     if store:
         env["STORE"] = store
+    if disable_protonfixes:
+        env["PROTONFIXES_DISABLE"] = "1"
 
     # ── Sandbox filesystem exposure (dynamic — no hardcoded paths) ───────
     share_roots = set()
@@ -2319,6 +2967,34 @@ class LudusaviInstallWorker(_NAGOThread):
             self.failed.emit(str(e))
 
 
+class LudusaviLatestVersionWorker(_NAGOThread):
+    """Fetches the latest ludusavi release tag from GitHub — button-triggered
+    only, never on Settings open. Mirrors UmuLatestVersionWorker."""
+    got_version = pyqtSignal(str)  # tag string, or '' on failure
+
+    def run(self):
+        try:
+            r = _requests().get(
+                _LUDUSAVI_RELEASES_API,
+                headers={"Accept": "application/vnd.github+json"},
+                params={"per_page": 15},
+                timeout=10,
+            )
+            r.raise_for_status()
+            releases = r.json() or []
+            for rel in releases:
+                if rel.get("draft") or rel.get("prerelease"):
+                    continue
+                for a in rel.get("assets", []):
+                    if _LUDUSAVI_LINUX_RE.match(a.get("name", "")):
+                        self.got_version.emit(rel.get("tag_name", ""))
+                        return
+            self.got_version.emit("")
+        except Exception as e:
+            _NAGOLog.session(f"[warn] LudusaviLatestVersionWorker: {e}")
+            self.got_version.emit("")
+
+
 class LudusaviManifestUpdateWorker(_NAGOThread):
     """
     Refresh the ludusavi primary manifest (manifest.yaml — the game-save
@@ -2616,6 +3292,30 @@ def _ludusavi_steam_roots_for_appid(appid: str) -> list:
     return [{"store": "steam", "path": p} for p in paths]
 
 
+def resolve_steam_prefix(appid: str) -> "Path | None":
+    """The actual WINEPREFIX folder Steam uses for `appid`
+    (<library>/steamapps/compatdata/<appid>/pfx), or None if the appid can't
+    be matched to a library or the compatdata folder doesn't exist yet
+    (game never launched through Steam). Note this is Steam's own Proton
+    runtime's prefix, not one umu/GE-Proton created — pointing a NAGO Tool
+    at it works the same mechanically (it's just a WINEPREFIX path) but the
+    prefix layout depends on whichever Proton version Steam last used."""
+    appid = (appid or "").strip()
+    if not appid:
+        return None
+    main = _ludusavi_steam_root()
+    if not main:
+        return None
+    libs = _parse_steam_libraryfolders(main)
+    candidates = [lib for lib, appids in libs if appid in appids]
+    candidates += [lib for lib, _ in libs if lib not in candidates]
+    for lib_path in candidates:
+        pfx = Path(lib_path) / "steamapps" / "compatdata" / appid / "pfx"
+        if pfx.exists():
+            return pfx
+    return None
+
+
 def _find_ubisoft_launcher(drive_c: Path) -> str:
     """
     Return the in-prefix 'Ubisoft Game Launcher' dir if Ubisoft Connect is installed
@@ -2801,7 +3501,7 @@ def _renpy_save_globs(game: dict) -> list[str]:
             gid = game.get("id")
             if not gid:
                 return []
-            base = get_prefixes_root() / f"{slugify(game.get('name', '')) or 'game'}_{gid}"
+            base = derive_prefix_path(game.get('name', ''), gid)
         pfx = base / "pfx"
         target = pfx if (pfx / "drive_c").exists() else base
         drive_c = target / "drive_c"
@@ -2843,7 +3543,7 @@ def ludusavi_roots_for_game(game: dict) -> list[dict]:
             gid = game.get("id")
             if not gid:
                 return []
-            base = get_prefixes_root() / f"{slugify(game.get('name', '')) or 'game'}_{gid}"
+            base = derive_prefix_path(game.get('name', ''), gid)
         pfx = base / "pfx"
         target = pfx if (pfx / "drive_c").exists() else base
         roots = [{"store": "otherWine", "path": str(target)}]
@@ -3971,8 +4671,15 @@ class LudusaviBackupWorker(_NAGOThread):
             # ── Phase 3: real backup ───────────────────────────────────────────
             self.progress.emit("Backing up…")
             try:
+                # --full-limit 100: keep up to 100 versioned full backups per
+                # game and let ludusavi prune older ones automatically. Without
+                # it, --force overwrites the single backup every time — a bad
+                # save could clobber a good one with no recovery. 100 is a soft
+                # cap (nobody hits it) that still bounds unlimited growth.
+                # Restore currently grabs latest; a version-picker (restore
+                # --backup <ID> from the `backups` command) is the next step.
                 data, err = _run_ludusavi_json(
-                    ["backup", "--api", "--force"]
+                    ["backup", "--api", "--force", "--full-limit", "100"]
                     + (["--path", self._backup_root] if self._backup_root else [])
                     + [self._title], timeout=600
                 )
@@ -4020,11 +4727,17 @@ class LudusaviRestoreWorker(_NAGOThread):
     done     = pyqtSignal(dict)
     failed   = pyqtSignal(str)
 
-    def __init__(self, game: dict, title: str, restore_root: str = "", parent=None):
+    def __init__(self, game: dict, title: str, restore_root: str = "",
+                 backup_id: str = "", parent=None):
         super().__init__(parent)
         self._game  = dict(game)
         self._title        = title
         self._restore_root = restore_root
+        # backup_id: a specific ludusavi version name (e.g. "backup-20260718T204648Z"
+        # or the legacy ".") from the `backups` command, chosen in the version
+        # picker. Empty = restore latest (ludusavi's default), preserving the
+        # prior behavior for callers that don't pick a version.
+        self._backup_id    = backup_id
 
     def run(self):
         try:
@@ -4067,6 +4780,7 @@ class LudusaviRestoreWorker(_NAGOThread):
                 data, err = _run_ludusavi_json(
                     ["restore", "--api", "--force"]
                     + (["--path", self._restore_root] if self._restore_root else [])
+                    + (["--backup", self._backup_id] if self._backup_id else [])
                     + [self._title], timeout=600
                 )
             finally:
@@ -4091,6 +4805,309 @@ class LudusaviRestoreWorker(_NAGOThread):
             self.done.emit(summary)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class LudusaviBackupsListWorker(_NAGOThread):
+    """
+    List the versioned backups ludusavi holds for one title in one backup root.
+
+    Runs `backups --api --path <root> <title>` and emits the per-version list
+    (newest first). Each version dict: {"name": str, "when": datetime|None,
+    "locked": bool}. `name` is the ID passed to `restore --backup`; the legacy
+    single backup reports name ".". Fast (folder-metadata read only) but still
+    a subprocess, so it runs off the UI thread like every other ludusavi call.
+    """
+    listed = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, title: str, root: str = "", parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._root  = root
+
+    def run(self):
+        try:
+            args = ["backups", "--api"]
+            if self._root:
+                args += ["--path", self._root]
+            args += [self._title]
+            data, err = _run_ludusavi_json(args, timeout=120)
+            if not data:
+                self.failed.emit(err or "No backup list produced.")
+                return
+            games = (data.get("games") or {}) if isinstance(data, dict) else {}
+            # Match the title alias-safely: prefer exact key, else the sole entry.
+            entry = games.get(self._title)
+            if entry is None and len(games) == 1:
+                entry = next(iter(games.values()))
+            raw = (entry.get("backups") or []) if isinstance(entry, dict) else []
+
+            from datetime import datetime as _datetime
+            versions = []
+            for b in raw:
+                if not isinstance(b, dict):
+                    continue
+                name = str(b.get("name") or "").strip()
+                if not name:
+                    continue
+                when = None
+                w = str(b.get("when") or "").strip()
+                if w:
+                    try:
+                        when = _datetime.fromisoformat(w).astimezone()
+                    except Exception:
+                        when = None
+                versions.append({
+                    "name":   name,
+                    "when":   when,
+                    "locked": bool(b.get("locked", False)),
+                })
+            # Newest first; entries without a timestamp sink to the bottom.
+            versions.sort(
+                key=lambda v: v["when"].timestamp() if v["when"] else 0.0,
+                reverse=True,
+            )
+            self.listed.emit(versions)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class LudusaviVersionSizeWorker(_NAGOThread):
+    """
+    Compute file-count + total bytes for each backup version, progressively.
+
+    For every version name, runs `restore --api --preview --backup <name>
+    [--path <root>] <title>` and emits sized(name, file_count, total_bytes)
+    as each completes, then all_done(). `backups` itself reports no size, so a
+    per-version restore --preview is the only tool-owned source (we deliberately
+    do NOT du the on-disk folders — that couples to ludusavi's internal layout).
+    One preview subprocess per version: cheap at the 1-5 versions seen in
+    practice, bounded by the --full-limit cap nobody hits. A version whose
+    preview fails emits (name, -1, -1) so the row can show "size unavailable"
+    instead of hanging.
+    """
+    sized    = pyqtSignal(str, int, int)
+    all_done = pyqtSignal()
+
+    def __init__(self, title: str, root: str, names: list, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._root  = root
+        self._names = list(names)
+
+    def run(self):
+        for name in self._names:
+            if self.isInterruptionRequested():
+                break
+            try:
+                args = ["restore", "--api", "--preview", "--backup", name]
+                if self._root:
+                    args += ["--path", self._root]
+                args += [self._title]
+                data, _ = _run_ludusavi_json(args, timeout=120)
+                if not data:
+                    self.sized.emit(name, -1, -1)
+                    continue
+                overall = (data.get("overall") or {}) if isinstance(data, dict) else {}
+                games   = (data.get("games")   or {}) if isinstance(data, dict) else {}
+                count = sum(
+                    len((g.get("files") or {}))
+                    for g in games.values()
+                    if isinstance(g, dict)
+                )
+                total = int(overall.get("totalBytes", 0) or 0)
+                self.sized.emit(name, count, total)
+            except Exception:
+                self.sized.emit(name, -1, -1)
+        self.all_done.emit()
+
+
+class RestoreVersionPickerDialog(_NAGODialog):
+    """
+    Pick which versioned backup to restore for one game.
+
+    Shown only when a title has 2+ versions in the chosen backup root. Each row
+    shows the local date/time, a relative age, a lock marker, and — filled in
+    progressively by LudusaviVersionSizeWorker — the file count and total size.
+    Restore is clickable immediately (restoring doesn't need the size); rows show
+    "…" until their preview returns. Newest version is pre-selected.
+
+    Uses the standard NAGO frameless chrome (_NAGODialog shadow/drag/auto-delete,
+    #dialogRoot frame, #dlgTitle, #primary/#secondary buttons) so it matches every
+    other launcher dialog rather than falling back to the native window frame.
+    """
+
+    def __init__(self, parent, game_name: str, title: str, root: str, versions: list):
+        super().__init__(parent)
+        self._versions = list(versions)
+        self._name_to_row: dict = {}
+        self._row_base:    dict = {}          # row index -> base text (date/age/lock)
+        self._size_worker = None
+
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _min_w = 520 + self._SHADOW * 2
+        _min_h = 300 + self._SHADOW * 2
+        self.setMinimumSize(_min_w, _min_h)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(self._SHADOW, self._SHADOW, self._SHADOW, self._SHADOW)
+        outer.setSpacing(0)
+        root_frame = QFrame()
+        root_frame.setObjectName("dialogRoot")
+        outer.addWidget(root_frame)
+
+        lay = QVBoxLayout(root_frame)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(10)
+
+        title_lbl = QLabel(f"Restore saves for {game_name}")
+        title_lbl.setObjectName("dlgTitle")
+        title_lbl.setWordWrap(True)
+        lay.addWidget(title_lbl)
+
+        sub = QLabel("Choose which version to restore. This overwrites current save files.")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        self._list = QListWidget()
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Expanding)
+        for i, v in enumerate(self._versions):
+            base = self._base_text(v)
+            self._list.addItem(f"{base}      …")
+            it = self._list.item(i)
+            it.setData(Qt.ItemDataRole.UserRole, v["name"])
+            self._name_to_row[v["name"]] = i
+            self._row_base[i] = base
+        self._list.setCurrentRow(0)
+        self._list.itemDoubleClicked.connect(lambda *_: self.accept())
+        lay.addWidget(self._list)
+
+        lay.addSpacing(6)
+        btn_row = QHBoxLayout()
+        btn_cancel  = QPushButton("  Cancel")
+        btn_cancel.setObjectName("secondary")
+        btn_cancel.setIcon(ph_icon("x", 22))
+        btn_restore = QPushButton("Restore")
+        btn_restore.setObjectName("primary")
+        btn_cancel.clicked.connect(self.reject)
+        btn_restore.clicked.connect(self.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_restore)
+        lay.addLayout(btn_row)
+
+        # Default size fits ~8 rows; the list expands to fill on resize. The
+        # dialog is resizable via the bottom-right grip, so a long version list
+        # scrolls and the window can be grown to see more at once.
+        rows   = max(3, min(len(self._versions), 8))
+        row_h  = self._list.sizeHintForRow(0)
+        if row_h <= 0:
+            row_h = 28
+        self._list.setMinimumHeight(2 * row_h + 10)
+        _chrome_h = 190 + self._SHADOW * 2   # header + subtitle + buttons + margins
+        self.resize(560 + self._SHADOW * 2, _chrome_h + rows * row_h)
+
+        # Bottom-right resize handle. Same primitive as ManualPathsDialog; on
+        # Wayland (Qt6) QSizeGrip routes through startSystemResize.
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(16, 16)
+
+        self._start_sizing(title, root)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Park the grip at the dialogRoot's inner bottom-right corner, just
+        # inside the shadow margin.
+        if hasattr(self, "_grip"):
+            s = self._SHADOW
+            self._grip.move(self.width()  - s - self._grip.width(),
+                            self.height() - s - self._grip.height())
+            self._grip.raise_()
+
+    @staticmethod
+    def _base_text(v: dict) -> str:
+        when = v.get("when")
+        if when is not None:
+            date_str = when.strftime("%b %d, %Y · %H:%M")
+            age      = RestoreVersionPickerDialog._age_str(when)
+            head     = f"{date_str}   ({age})"
+        else:
+            head = "unknown date"
+        if v.get("locked"):
+            head += "   ·   locked"
+        return head
+
+    @staticmethod
+    def _age_str(when) -> str:
+        from datetime import datetime as _dt
+        try:
+            now  = _dt.now(when.tzinfo)
+            secs = (now - when).total_seconds()
+        except Exception:
+            return "?"
+        if secs < 0:
+            return "just now"
+        mins = secs / 60
+        if mins < 1:
+            return "just now"
+        if mins < 60:
+            return f"{int(mins)} min ago"
+        hrs = mins / 60
+        if hrs < 24:
+            return f"{int(hrs)} h ago"
+        days = hrs / 24
+        if days < 30:
+            return f"{int(days)} d ago"
+        return when.strftime("%b %d, %Y")
+
+    def _start_sizing(self, title: str, root: str):
+        names = [v["name"] for v in self._versions]
+        self._size_worker = LudusaviVersionSizeWorker(title, root, names)
+        self._size_worker.sized.connect(self._on_sized)
+        self._size_worker.finished.connect(self._size_worker.deleteLater)
+        self._size_worker.start()
+
+    def _on_sized(self, name: str, count: int, total_bytes: int):
+        row = self._name_to_row.get(name)
+        if row is None:
+            return
+        it = self._list.item(row)
+        if it is None:
+            return
+        base = self._row_base.get(row, "")
+        if count < 0 or total_bytes < 0:
+            tail = "size unavailable"
+        else:
+            mb = total_bytes / (1024 * 1024)
+            tail = f"{count} file(s) · {mb:.1f} MB"
+        it.setText(f"{base}      {tail}")
+
+    def chosen_backup_id(self) -> str:
+        it = self._list.currentItem()
+        if it is None:
+            return ""
+        return str(it.data(Qt.ItemDataRole.UserRole) or "")
+
+    def reject(self):
+        self._stop_worker()
+        super().reject()
+
+    def accept(self):
+        self._stop_worker()
+        super().accept()
+
+    def _stop_worker(self):
+        w = self._size_worker
+        if w is not None:
+            try:
+                if w.isRunning():
+                    w.requestInterruption()
+                    w.wait(3000)
+            except Exception:
+                pass
 
 
 class ManualBackupWorker(_NAGOThread):
@@ -4449,24 +5466,76 @@ class WinetricksPresetWorker(_NAGOThread):
 
 
 # ── Proton Scanner ─────────────────────────────────────────────────────────────
+def _proton_short_version(proton_dir: Path) -> str:
+    """Read the numeric version portion from a Proton build's `version` file
+    (root or files/version). Returns e.g. '10-15' for 'GE-Proton10-15' —
+    the name prefix is stripped since the combo label already carries the
+    flavor. Returns '' when there is no version file, the file only holds a
+    unix timestamp, or the token has no digits. Deliberately NO dir-name
+    fallback — a missing version simply isn't shown."""
+    for vf in (proton_dir / "version", proton_dir / "files" / "version"):
+        try:
+            if not vf.exists():
+                continue
+            toks = vf.read_text(errors="ignore").strip().split()
+            if not toks:
+                return ""
+            v = toks[-1]
+            # Version files are 'TIMESTAMP name' — a single all-digit token
+            # means the name part is absent, leaving only the timestamp.
+            if v.isdigit() and len(v) >= 8:
+                return ""
+            m = re.search(r"\d", v)
+            if not m:
+                return ""
+            return v[m.start():]
+        except Exception:
+            return ""
+    return ""
+
+
 def find_proton_installations() -> list[dict]:
     """
     Scan common locations for Proton installations.
     Returns a list of dicts: {label, path}  where path is the 'proton' executable.
+
+    Labels carry no location suffixes — where a build was found is trivia
+    (umu just needs PROTONPATH). Rolling installs whose directory name hides
+    the real version (e.g. 'Proton-GE Latest') get the version number from
+    the build's `version` file appended, e.g. 'Proton-GE Latest (10-15)';
+    pinned installs like 'GE-Proton10-14' stay bare since the number is
+    already in the name. Duplicate copies of the same build across sources
+    (host / Flatpak / system compatibilitytools.d) collapse to one entry —
+    first found wins by scan order below. A genuinely different build hiding
+    under a duplicate name is reachable via Custom path.
+
     Result is cached at module level after the first call — Proton installs don't
     change during a session. Call _invalidate_proton_cache() to force a rescan.
     """
     global _proton_installations_cache
     if _proton_installations_cache is not None:
         return _proton_installations_cache
-    found = []
-    seen  = set()
+    found      = []
+    seen       = set()   # resolved proton-exe paths
+    seen_names = set()   # normalized labels — collapses same-named copies
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
 
     def _add(label: str, proton_exe: Path):
         key = str(proton_exe.resolve())
-        if key not in seen and proton_exe.exists():
-            seen.add(key)
-            found.append({"label": label, "path": key})
+        if key in seen or not proton_exe.exists():
+            return
+        nl = _norm(label)
+        if nl in seen_names:
+            return
+        seen.add(key)
+        seen_names.add(nl)
+        # Append the version number when the label doesn't already carry it
+        ver = _proton_short_version(proton_exe.parent)
+        if ver and _norm(ver) not in nl:
+            label = f"{label} ({ver})"
+        found.append({"label": label, "path": key})
 
     # ── Steam library roots ────────────────────────────────────────────────────
     steam_roots = [
@@ -4511,7 +5580,9 @@ def find_proton_installations() -> list[dict]:
         for entry in sorted(flatpak_steam.iterdir()):
             if entry.is_dir() and "proton" in entry.name.lower():
                 proton_exe = entry / "proton"
-                _add(f"{entry.name} (Flatpak)", proton_exe)
+                # No location suffix — a Flatpak copy of the same build dedupes
+                # against the host copy by name; first found wins.
+                _add(entry.name, proton_exe)
 
     # ── Proton-GE installed via ProtonUp-Qt or manually ────────────────────────
     ge_locations = [
@@ -4525,13 +5596,15 @@ def find_proton_installations() -> list[dict]:
     for loc in ge_locations:
         if not loc.exists():
             continue
-        is_system = str(loc).startswith("/usr") or str(loc).startswith("/usr/local")
         for entry in sorted(loc.iterdir()):
             if not entry.is_dir():
                 continue
             proton_exe = entry / "proton"
-            suffix = " (System)" if is_system else " (GE)"
-            _add(f"{entry.name}{suffix}", proton_exe)
+            # No "(GE)"/"(System)" suffixes — the tag marked the source
+            # directory, not the build flavor, and mislabeled non-GE builds
+            # (e.g. "Proton-CachyOS Latest (GE)"). Same-named copies across
+            # locations dedupe in _add.
+            _add(entry.name, proton_exe)
 
     # ── System-installed Proton (distro packages) ──────────────────────────────
     system_paths = [
@@ -5128,7 +6201,8 @@ class _RunInPrefixWorker(_NAGOThread):
                 self.failed.emit(str(e))
 
 
-def _fire_steam_exit_post_cmd_async(post_exit_cmd: str, identifier: str = ""):
+def _fire_steam_exit_post_cmd_async(post_exit_cmd: str, identifier: str = "",
+                                    skip_hdr: bool = False):
     """Fire the user's post-exit command plus an unconditional HDR-disable
     for a Steam game that just exited (normal exit OR Force Terminate —
     both route through the same poll-loop cleanup that calls this).
@@ -5162,7 +6236,14 @@ def _fire_steam_exit_post_cmd_async(post_exit_cmd: str, identifier: str = ""):
     identical to this never having run."""
     _tag = f"[steam-exit appid={identifier}]" if identifier else "[steam-exit]"
     def _work():
-        _, hdr_post = _hdr_commands()
+        # skip_hdr: a NAGO-tracked HDR game (native/Proton) is still running —
+        # its own exit restores SDR. Disabling here would flip the monitor to
+        # SDR underneath it (same concurrent-HDR bug fixed in the poll loop).
+        if skip_hdr:
+            hdr_post = ""
+            _NAGOLog.launch(f"{_tag} HDR-disable skipped — an HDR game is still running")
+        else:
+            _, hdr_post = _hdr_commands()
         cmd = post_exit_cmd
         if hdr_post:
             cmd = f"{cmd} ; {hdr_post}" if cmd else hdr_post
@@ -5325,6 +6406,12 @@ def _classify_exe(path: str) -> str:
         if not p.is_file():
             return "unknown"
 
+        # .msi is definitionally an installer — the binary signature scan
+        # below can't see it (OLE compound format, no packer strings), and
+        # the Run-in-Prefix file filter allows picking one.
+        if p.suffix.lower() == ".msi":
+            return "installer"
+
         # ── Pass 1: binary string scan on the exe itself (first 512 KB) ──
         _INSTALLER_SIGS = [
             b"Inno Setup",
@@ -5390,6 +6477,15 @@ def _classify_exe(path: str) -> str:
                 return "game"
         except OSError:
             pass
+
+        # ── Pass 3: filename lean — weakest signal, only upgrades 'unknown' ──
+        # Exotic installer tech the signature list misses is still almost
+        # always NAMED setup/install. Binary evidence (Passes 1-2) always
+        # wins over the name; 'unins' is excluded so uninstallers don't
+        # count as installers.
+        n = p.name.lower()
+        if ("setup" in n or "install" in n) and not n.startswith("unins"):
+            return "installer"
 
         return "unknown"
 
@@ -6127,17 +7223,17 @@ def find_all_gog_games() -> list[dict]:
 # Order matches the swatch order in SettingsPage.
 ACCENT_COLORS = {
     "#4f46e5": "#818cf8",   # indigo   (default)
-    "#1d4ed8": "#60a5fa",   # blue
-    "#0284c7": "#38bdf8",   # sky
-    "#0f766e": "#2dd4bf",   # teal
-    "#16a34a": "#4ade80",   # green
-    "#65a30d": "#a3e635",   # lime
-    "#ca8a04": "#facc15",   # yellow
-    "#ea580c": "#fb923c",   # orange
     "#dc2626": "#f87171",   # red
+    "#ea580c": "#fb923c",   # orange
+    "#eab308": "#fde047",   # yellow
+    "#16a34a": "#4ade80",   # green
+    "#0d9488": "#2dd4bf",   # teal
+    "#0ea5e9": "#7dd3fc",   # sky
+    "#2563eb": "#60a5fa",   # blue
+    "#9333ea": "#c084fc",   # purple
     "#db2777": "#f472b6",   # pink
-    "#7c3aed": "#a78bfa",   # violet
-    "#c026d3": "#e879f9",   # fuchsia
+    "#92400e": "#d08a4e",   # brown
+    "#475569": "#94a3b8",   # slate
 }
 DEFAULT_ACCENT  = "#4f46e5"
 DEFAULT_ACCENT2 = "#818cf8"
@@ -6199,7 +7295,8 @@ DARK_TOKENS: dict[str, str] = {
     "__T_PILL_ERR_BG__":     "#3b1c1c",
     "__T_PILL_PEND_FG__":    "#7e7e88",
     "__T_PILL_PEND_BG__":    "#2d2d32",
-    "__T_PLACEHOLDER__":     "#3f3f46",
+    "__T_PLACEHOLDER__":     "#38383e",
+    "__T_PLACEHOLDER_HI__":  "#45454d",   # search box — hint must stay readable
     "__T_MUTED__":           "#52525b",
     "__T_EMPTY__":           "#424248",
     # Interactive
@@ -6231,28 +7328,28 @@ DARK_TOKENS: dict[str, str] = {
 
 LIGHT_TOKENS: dict[str, str] = {
     # Backgrounds
-    "__T_BG__":              "#f5f5f7",
-    "__T_SIDEBAR_BG__":      "#ebebef",
+    "__T_BG__":              "#f0f0f3",
+    "__T_SIDEBAR_BG__":      "#dcdce2",
     "__T_SURFACE__":         "#ffffff",
-    "__T_SURFACE2__":        "#f8f8fa",
+    "__T_SURFACE2__":        "#ffffff",
     "__T_SURFACE_HOVER__":   "#e8e8ec",
     "__T_SURFACE_CHK__":     "__ACCENT_BG__",  # expands in 2nd pass
     "__T_TOPBAR_BG__":       "#fafafa",
     "__T_DIALOG_BG__":       "#ffffff",
-    "__T_SECTION_BG__":      "#f0f0f4",
+    "__T_SECTION_BG__":      "#ececf1",
     "__T_DISABLED_BG__":     "#e6e6ea",
     "__T_CARD_BG__":         "#ffffff",
     "__T_CARD_HOVER__":      "#f5f5fa",
-    "__T_ENV_HDR_BG__":      "#f0f0f4",
+    "__T_ENV_HDR_BG__":      "#ececf1",
     "__T_COMBO_BG__":        "#ffffff",
     # Borders
-    "__T_BORDER__":          "#d4d4d8",
-    "__T_BORDER2__":         "#e0e0e4",
-    "__T_BORDER3__":         "#dcdce0",
-    "__T_BORDER_H__":        "#c4c4c8",
+    "__T_BORDER__":          "#c8c8d0",
+    "__T_BORDER2__":         "#cfcfd7",
+    "__T_BORDER3__":         "#d2d2d9",
+    "__T_BORDER_H__":        "#b0b0b8",
     "__T_COMBO_BORDER__":    "#c4c4cf",
     "__T_SEC_CHK_BORDER__":  "__ACCENT__",  # expands in 2nd pass
-    "__T_ENV_ROW_BDR__":     "#ebebef",
+    "__T_ENV_ROW_BDR__":     "#d6d6dc",
     # Text
     "__T_TEXT__":            "#18181b",
     "__T_TEXT2__":           "#3f3f46",
@@ -6262,7 +7359,7 @@ LIGHT_TOKENS: dict[str, str] = {
     "__T_TEXT6__":           "#a1a1aa",
     "__T_TEXT7__":           "#52525b",
     "__T_TEXT8__":           "#71717a",
-    "__T_TEXT_DISABLED__":   "#a1a1aa",
+    "__T_TEXT_DISABLED__":   "#c6c6ce",
     "__T_PILL_FG__":         "#166534",
     "__T_PILL_BG__":         "#dcfce7",
     "__T_PILL_WARN_FG__":    "#92400e",
@@ -6271,7 +7368,8 @@ LIGHT_TOKENS: dict[str, str] = {
     "__T_PILL_ERR_BG__":     "#fee2e2",
     "__T_PILL_PEND_FG__":    "#71717a",
     "__T_PILL_PEND_BG__":    "#e4e4e8",
-    "__T_PLACEHOLDER__":     "#c4c4cf",
+    "__T_PLACEHOLDER__":     "#d2d2da",
+    "__T_PLACEHOLDER_HI__":  "#c4c4cf",   # search box — hint must stay readable
     "__T_MUTED__":           "#c4c4cf",
     "__T_EMPTY__":           "#c4c4cf",
     # Interactive
@@ -6304,10 +7402,11 @@ LIGHT_TOKENS: dict[str, str] = {
 
 @functools.lru_cache(maxsize=1)
 def _load_stylesheet() -> str:
-    """Load the QSS stylesheet from nago-launcher.qss next to this script.
-    Result is cached — the file never changes at runtime.
+    """Load the QSS stylesheet from assets/nago-launcher.qss.
+    Result is cached (lru_cache) — the file never changes at runtime; theme
+    and accent substitutions happen on a copy in _apply_stylesheet.
     Falls back to an empty string so the app still launches if the file is missing."""
-    qss_path = _nago_asset("nago-launcher.qss")
+    qss_path = _nago_asset("assets", "nago-launcher.qss")
     try:
         return qss_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -6485,6 +7584,26 @@ class _LibraryGrid(QWidget):
         self._scroll_timer.setInterval(30)          # 30ms tick → ~33 fps
         self._scroll_timer.timeout.connect(self._do_scroll)
         self._scroll_dir   = 0                      # -1 up, 0 none, +1 down
+
+        # Smooth-wheel glide state (driven by NAGOSmoothScroller callbacks).
+        # While True, GameCard.enterEvent skips its hover reaction so cards
+        # sweeping under a stationary cursor don't ripple half-raised names.
+        self._gliding = False
+        # Set by LibraryPage: cancels an in-flight wheel glide the moment a
+        # card drag starts, so the glide animation and the drag auto-scroll
+        # timer never write the same scrollbar simultaneously.
+        self._glide_cancel = None
+
+    def _set_gliding(self, on: bool):
+        """NAGOSmoothScroller callback. On glide end, re-apply hover to the
+        card that ended up under the cursor (its Enter was suppressed)."""
+        self._gliding = on
+        if not on:
+            for _c in self._ordered:
+                if (_c.isVisible() and _c.underMouse()
+                        and not getattr(_c, "_name_raised", False)):
+                    _c._apply_hover()
+                    break
 
     def set_accent(self, color: str):
         self._accent_color = color
@@ -6834,6 +7953,10 @@ class _LibraryGrid(QWidget):
             if (pos - self._drag_press_pos).manhattanLength() < self._DRAG_THRESHOLD:
                 return
             # Threshold crossed — start the drag
+            # Kill any in-flight wheel glide first: its animation and the
+            # drag auto-scroll timer must never co-write the scrollbar.
+            if self._glide_cancel is not None:
+                self._glide_cancel()
             src = self._drag_src_card
             self._drag_ordered_ex = [c for c in self._ordered
                                      if c.game["id"] != src.game["id"]]
@@ -6882,11 +8005,23 @@ class _LibraryGrid(QWidget):
         super().paintEvent(event)
         shadow = _card_shadow_px()
         m      = _SHADOW_M
+        dirty  = event.rect()
         p      = QPainter(self)
         for card in self._ordered:
             if card.isVisible():
                 geo = card.geometry()
-                p.drawPixmap(geo.x() - m, geo.y() - m, shadow)
+                # Only draw shadows intersecting the dirty region — during a
+                # scroll Qt blits the moved area and asks only for the exposed
+                # strip, so repaint cost stays proportional to what's on screen
+                # rather than library size. Full-container update() calls
+                # (reflow / drag gap / restore) pass a full-size dirty rect,
+                # so every shadow still draws in those paths.
+                # Rect matches the shadow pixmap's logical extents exactly:
+                # width + 2m, height + 2m + downward offset (_SHADOW_OY tail).
+                if QRect(geo.x() - m, geo.y() - m,
+                         geo.width() + m * 2,
+                         geo.height() + m * 2 + _SHADOW_OY).intersects(dirty):
+                    p.drawPixmap(geo.x() - m, geo.y() - m, shadow)
         p.end()
 
 
@@ -6900,10 +8035,10 @@ def _apply_palette(app: "QApplication", cfg: dict):
     pal = QPalette()
     _c  = QColor
     if theme == "light":
-        pal.setColor(QPalette.ColorRole.Window,          _c("#f5f5f7"))
+        pal.setColor(QPalette.ColorRole.Window,          _c("#f0f0f3"))
         pal.setColor(QPalette.ColorRole.WindowText,      _c("#18181b"))
         pal.setColor(QPalette.ColorRole.Base,            _c("#ffffff"))
-        pal.setColor(QPalette.ColorRole.AlternateBase,   _c("#f0f0f4"))
+        pal.setColor(QPalette.ColorRole.AlternateBase,   _c("#ececf1"))
         pal.setColor(QPalette.ColorRole.ToolTipBase,     _c("#ffffff"))
         pal.setColor(QPalette.ColorRole.ToolTipText,     _c("#18181b"))
         pal.setColor(QPalette.ColorRole.Text,            _c("#18181b"))
@@ -6913,9 +8048,12 @@ def _apply_palette(app: "QApplication", cfg: dict):
         pal.setColor(QPalette.ColorRole.Link,            _c(accent))
         pal.setColor(QPalette.ColorRole.Highlight,       _c(accent))
         pal.setColor(QPalette.ColorRole.HighlightedText, _c("#ffffff"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       _c("#a1a1aa"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, _c("#a1a1aa"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, _c("#a1a1aa"))
+        # Placeholder text — kept in sync with the __T_PLACEHOLDER__ QSS token
+        # (light). See dark-theme branch for why both exist.
+        pal.setColor(QPalette.ColorRole.PlaceholderText, _c("#d2d2da"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       _c("#c6c6ce"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, _c("#c6c6ce"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, _c("#c6c6ce"))
     else:
         pal.setColor(QPalette.ColorRole.Window,          _c("#1d1d20"))
         pal.setColor(QPalette.ColorRole.WindowText,      _c("#f4f4f5"))
@@ -6930,9 +8068,13 @@ def _apply_palette(app: "QApplication", cfg: dict):
         pal.setColor(QPalette.ColorRole.Link,            _c("#818cf8"))
         pal.setColor(QPalette.ColorRole.Highlight,       _c("#6366f1"))
         pal.setColor(QPalette.ColorRole.HighlightedText, _c("#ffffff"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       _c("#505058"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, _c("#505058"))
-        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, _c("#505058"))
+        # Placeholder text — kept in sync with the __T_PLACEHOLDER__ QSS token
+        # (dark). QSS-styled inputs use placeholder-text-color from the
+        # stylesheet; this palette role covers the manually-painted name field.
+        pal.setColor(QPalette.ColorRole.PlaceholderText, _c("#38383e"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text,       _c("#3d3d44"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, _c("#3d3d44"))
+        pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, _c("#3d3d44"))
     app.setPalette(pal)
 
 
@@ -6987,7 +8129,15 @@ def init_db():
     PREFIXES_PATH.mkdir(parents=True, exist_ok=True)
     TOOLS_HOME.mkdir(parents=True, exist_ok=True)
     _migrate_umu_to_tools()
-    con = sqlite3.connect(DB_PATH)
+    # isolation_level=None disables Python's legacy implicit-transaction
+    # management; the explicit BEGIN below puts EVERY statement — including
+    # DDL — into one transaction. Without this, each CREATE/ALTER autocommits
+    # individually (one fsync per statement: ~140ms on first run / migration,
+    # and a kill mid-migration left partial DDL applied). One transaction =
+    # one fsync, and migrations are atomic (all-or-nothing; the per-column
+    # existence checks self-heal on retry either way).
+    con = sqlite3.connect(DB_PATH, isolation_level=None)
+    con.execute("BEGIN")
     con.execute("""
         CREATE TABLE IF NOT EXISTS games (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7020,7 +8170,11 @@ def init_db():
             install_dir     TEXT DEFAULT '',
             custom_save_paths TEXT DEFAULT '',
             mangohud_enabled INTEGER DEFAULT 0,
-            rating REAL DEFAULT 0
+            rating REAL DEFAULT 0,
+            store_url TEXT DEFAULT '',
+            is_tool INTEGER DEFAULT 0,
+            prefix_owned INTEGER DEFAULT 1,
+            tool_dpi INTEGER DEFAULT 0
         )
     """)
     # Migrate existing DBs that pre-date the umu_* columns
@@ -7062,6 +8216,8 @@ def init_db():
         ("use_ludusavi",     "INTEGER DEFAULT 1"),
         ("mangohud_enabled", "INTEGER DEFAULT 0"),
         ("rating",           "REAL DEFAULT 0"),
+        ("store_url",        "TEXT DEFAULT ''"),
+        ("is_tool",          "INTEGER DEFAULT 0"),
     ]:
         if col not in existing_cols:
             con.execute(f"ALTER TABLE games ADD COLUMN {col} {ddl}")
@@ -7166,6 +8322,19 @@ def init_db():
     existing_cols = {row[1] for row in cur.fetchall()}
     if "prefix_path" not in existing_cols:
         con.execute("ALTER TABLE games ADD COLUMN prefix_path TEXT DEFAULT ''")
+    # prefix_owned: 1 = this row's prefix was created fresh by NAGO for it
+    # (Delete Prefix may act on it); 0 = prefix_path is a reference to another
+    # row's prefix, or a manually browsed path — never deletable through NAGO.
+    # DEFAULT 1 backfills every pre-existing row, which all own their own
+    # canonical prefix today (SQLite applies ADD COLUMN...DEFAULT to existing
+    # rows, no separate UPDATE needed).
+    if "prefix_owned" not in existing_cols:
+        con.execute("ALTER TABLE games ADD COLUMN prefix_owned INTEGER DEFAULT 1")
+    # tool_dpi: Wine LogPixels override applied only while THIS tool runs
+    # (set before launch, restored on exit). 0 = off (never touch the
+    # registry). Tools only — the launch bracket is gated on is_tool.
+    if "tool_dpi" not in existing_cols:
+        con.execute("ALTER TABLE games ADD COLUMN tool_dpi INTEGER DEFAULT 0")
     # Ludusavi save-backup: resolved manifest title override + last successful backup stamp
     if "ludusavi_title" not in existing_cols:
         con.execute("ALTER TABLE games ADD COLUMN ludusavi_title TEXT DEFAULT ''")
@@ -7210,7 +8379,9 @@ def init_db():
     gc_cols = {row[1] for row in cur.fetchall()}
     if "sort_pos" not in gc_cols:
         con.execute("ALTER TABLE game_categories ADD COLUMN sort_pos INTEGER DEFAULT 0")
-    con.commit()
+    # Explicit COMMIT — con.commit() is a no-op under isolation_level=None
+    # (the module isn't tracking the transaction; we opened it with BEGIN).
+    con.execute("COMMIT")
     con.close()
 
     # Clean up orphaned temp covers (slug_0.png) left by crashes during Add/Edit Game.
@@ -7252,7 +8423,7 @@ def load_config():
         _config_cache = {
             "sgdb_key": "", "steam_api_key": "", "default_proton": "",
             "umu_default_enabled": True, "global_env": "",
-            "accent_color": DEFAULT_ACCENT, "card_width": 185,
+            "accent_color": DEFAULT_ACCENT, "card_width": 180,
         }
     return dict(_config_cache)
 
@@ -7263,6 +8434,22 @@ def save_config(cfg: dict):
     with open(CFG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
     _config_cache = dict(cfg)  # update cache to match what was written
+
+def merge_save_config(partial: dict) -> dict:
+    """Merge-save: overlay ONLY the given keys onto the freshest config and
+    persist. Returns the merged dict so callers can refresh their local copy.
+
+    Use this instead of save_config() whenever the caller holds a config
+    snapshot older than "right now" — i.e. any long-lived widget. Passing a
+    stale full dict to save_config() reverts every key another component
+    saved in the meantime (umu_version after an update, last_browse_dir from
+    file dialogs, winetricks_etag, dialog geometry, ...). Verified clobber,
+    fixed 12-07-2026. Callers pass exactly the keys they own — nothing else
+    on disk can be touched, so the bug class is dead rather than patched."""
+    cfg = load_config()
+    cfg.update(partial)
+    save_config(cfg)
+    return cfg
 
 # ── Steam playtime helpers ─────────────────────────────────────────────────────
 def steam_playtime_for_appid(appid: str, api_key: str) -> int:
@@ -7558,21 +8745,101 @@ class SGDBWorker(_NAGOThread):
 
 # ── Cover thumbnail loader ─────────────────────────────────────────────────────
 class ThumbnailWorker(_NAGOThread):
-    _log_lifecycle = False  # spawns frequently during library load — too noisy
-    loaded = pyqtSignal(int, QPixmap)   # game_id, pixmap
+    """Loads AND fully composes card covers off the main thread.
 
-    def __init__(self, tasks: list):    # [(game_id, path)]
+    All expensive work — decode, two-pass smooth downscale, center-crop,
+    top-corner rounding, and the bottom name-scrim gradient — runs here on
+    QImage (thread-safe to paint on, unlike QPixmap). The main thread only
+    does a cheap QPixmap.fromImage per cover in _on_thumb_loaded.
+
+    The scaling math replicates GameCard.set_cover() exactly (same DPR
+    target, same two-pass SmoothTransformation, same KeepAspectRatioByExpanding
+    + center-crop, same corner path) so output is pixel-identical to the old
+    main-thread path. Sizes and DPR are captured at construction — a rebuild
+    after a card-width change always spawns a fresh worker with fresh values.
+
+    `generation` is echoed back in the loaded signal so LibraryPage can drop
+    late emissions from a superseded worker (e.g. card width changed while
+    covers were still streaming in) — otherwise stale-size covers could land
+    on freshly rebuilt cards.
+    """
+    _log_lifecycle = False  # spawns frequently during library load — too noisy
+    loaded = pyqtSignal(int, QImage, int)   # game_id, composed cover, generation
+
+    def __init__(self, tasks: list, cover_w: int, cover_h: int,
+                 radius: int, dpr: float, generation: int):    # tasks: [(game_id, path)]
         super().__init__()
-        self.tasks = tasks
+        self.tasks       = tasks
+        self._cover_w    = cover_w
+        self._cover_h    = cover_h
+        self._radius     = radius
+        self._dpr        = dpr or 1.0
+        self._generation = generation
 
     def run(self):
+        dpr = self._dpr
+        pw  = max(1, round(self._cover_w * dpr))
+        ph  = max(1, round(self._cover_h * dpr))
+        r   = self._radius * dpr
+
         for gid, path in self.tasks:
             try:
-                px = QPixmap(path)
-                if not px.isNull():
-                    # Don't scale here — the worker can't query devicePixelRatio of a widget.
-                    # Pass the original through; set_cover() does the HiDPI-aware scaling.
-                    self.loaded.emit(gid, px)
+                src = QImage(path)
+                if src.isNull():
+                    continue
+
+                # Two-pass downscale to physical target: halve first when source
+                # is >2× the target in either dimension, then hit the exact
+                # physical size — same math as GameCard.set_cover().
+                if src.width() > pw * 2 or src.height() > ph * 2:
+                    src = src.scaled(max(pw, src.width() // 2),
+                                     max(ph, src.height() // 2),
+                                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                     Qt.TransformationMode.SmoothTransformation)
+                result = src.scaled(pw, ph,
+                                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                    Qt.TransformationMode.SmoothTransformation)
+                # Center-crop any overflow from the expand
+                if result.width() > pw or result.height() > ph:
+                    x = (result.width()  - pw) // 2
+                    y = (result.height() - ph) // 2
+                    result = result.copy(x, y, pw, ph)
+
+                # Compose: round top corners + bake the bottom scrim gradient.
+                # Painting on QImage is explicitly thread-safe in Qt.
+                out = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
+                out.fill(Qt.GlobalColor.transparent)
+                cp = QPainter(out)
+                cp.setRenderHint(QPainter.RenderHint.Antialiasing)
+                clip = QPainterPath()
+                clip.moveTo(r, 0)
+                clip.lineTo(pw - r, 0)
+                clip.arcTo(pw - r * 2, 0, r * 2, r * 2, 90, -90)
+                clip.lineTo(pw, ph)
+                clip.lineTo(0, ph)
+                clip.arcTo(0, 0, r * 2, r * 2, 180, -90)
+                clip.closeSubpath()
+                cp.setClipPath(clip)
+                cp.drawImage(0, 0, result)
+
+                # Bottom scrim for name legibility — same stops as the old
+                # per-frame paintEvent draw (0 → 170 → 255 alpha, 86px cap),
+                # baked once here instead of redrawn on every card repaint.
+                # GameCard skips its runtime gradient when _gradient_baked is set.
+                grad_h = min(round(86 * dpr), ph)
+                cg = QLinearGradient(0, ph - grad_h, 0, ph)
+                cg.setColorAt(0.0, QColor(0, 0, 0, 0))
+                cg.setColorAt(0.5, QColor(0, 0, 0, 170))
+                cg.setColorAt(1.0, QColor(0, 0, 0, 255))
+                cp.setPen(Qt.PenStyle.NoPen)
+                cp.setBrush(QBrush(cg))
+                cp.drawRect(0, ph - grad_h, pw, grad_h)
+                cp.end()
+
+                # Tag DPR on the image — QPixmap.fromImage preserves it, so the
+                # cover displays at logical cover_w × cover_h on screen.
+                out.setDevicePixelRatio(dpr)
+                self.loaded.emit(gid, out, self._generation)
             except Exception as e:
                 _NAGOLog.session(f"[warn] ThumbnailWorker: failed to load cover for game {gid}: {e}")
 
@@ -8165,6 +9432,11 @@ class StarRating(QWidget):
       portion from the Fill family, clipped to a fraction of the cell width so
       any half-step renders as a true partial fill (no dedicated half glyph
       needed, and not limited to halves if that ever changes).
+    - "Armed" gates interaction without hiding the widget — used by GameCard's
+      hover row to show the current rating immediately but require a short
+      hover dwell before clicks are accepted, so passing the mouse over a card
+      never accidentally edits a rating. Defaults to True (dialog usage has no
+      such cooldown).
     """
     rating_changed = pyqtSignal(float)
 
@@ -8174,9 +9446,18 @@ class StarRating(QWidget):
         self._gap = max(4, star_px // 6)
         self._value = self._snap(value)
         self._hover = None
+        self._armed = True
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setFixedSize(self._star_px * 5 + self._gap * 4, self._star_px + 4)
+
+    def setArmed(self, armed: bool):
+        """Enable/disable click and hover-preview interaction without hiding
+        the widget. Disarming also clears any live hover preview."""
+        self._armed = armed
+        if not armed and self._hover is not None:
+            self._hover = None
+            self.update()
 
     @staticmethod
     def _snap(v) -> float:
@@ -8199,6 +9480,8 @@ class StarRating(QWidget):
         return idx + half
 
     def mouseMoveEvent(self, e):
+        if not self._armed:
+            return
         self._hover = self._snap(self._value_at(int(e.position().x())))
         self.update()
 
@@ -8207,6 +9490,8 @@ class StarRating(QWidget):
         self.update()
 
     def mousePressEvent(self, e):
+        if not self._armed:
+            return
         if e.button() == Qt.MouseButton.RightButton:
             # Right-click anywhere on the stars clears to unrated.
             self._value = 0.0
@@ -8222,6 +9507,12 @@ class StarRating(QWidget):
         self._hover = self._value if self._value else None
         self.update()
         self.rating_changed.emit(self._value)
+
+    def contextMenuEvent(self, e):
+        # Right-click is "clear rating" (handled in mousePressEvent). Accept the
+        # context-menu event so it never propagates to a parent — on a GameCard
+        # that would otherwise open the card's context menu on top of the clear.
+        e.accept()
 
     def paintEvent(self, e):
         _load_phosphor_font()
@@ -8267,6 +9558,8 @@ class GameCard(QFrame):
     run_in_prefix_requested   = pyqtSignal(dict)   # (game dict) — right-click "Run File in Prefix"
     stop_prefix_run_requested = pyqtSignal(dict)   # (game dict) — right-click "Stop Run in Prefix"
 
+    _STAR_ARM_DELAY = 600   # ms hover dwell before the rating stars accept clicks
+
     def __init__(self, game: dict, accent_color: str = DEFAULT_ACCENT, parent=None):
         super().__init__(parent)
         self.game = game
@@ -8302,6 +9595,17 @@ class GameCard(QFrame):
         # Respect the "show play button" setting — read from config at card creation.
         # Updated live via update_play_button() when settings change.
         self._play_button_enabled = bool(load_config().get("show_play_button", True))
+        # Respect the "show rating" setting — hover star row + name slide.
+        # Updated live via update_show_rating() when settings change.
+        self._show_rating = bool(load_config().get("show_rating", True))
+        # Star row must sit ABOVE the hover overlay so it receives mouse events
+        # (the overlay covers the whole card and would swallow clicks otherwise).
+        self._star_row.raise_()
+        self._star_row.setArmed(False)   # locked until _STAR_ARM_DELAY of hover dwell
+        self._star_arm_timer = QTimer(self)
+        self._star_arm_timer.setSingleShot(True)
+        self._star_arm_timer.setInterval(self._STAR_ARM_DELAY)
+        self._star_arm_timer.timeout.connect(lambda: self._star_row.setArmed(True))
 
         # True while the right-click context menu is open — used by the hover
         # overlay to hold the accent outline + tint even though leaveEvent fires
@@ -8315,7 +9619,12 @@ class GameCard(QFrame):
         LABEL_H = 64
         LABEL_BOTTOM_OFFSET = 8
         if hasattr(self, '_name_label'):
-            self._name_label.setGeometry(4, h - LABEL_H - LABEL_BOTTOM_OFFSET, w - 8, LABEL_H)
+            _y = h - LABEL_H - LABEL_BOTTOM_OFFSET
+            if getattr(self, "_name_raised", False):
+                _y -= self._star_lift
+            self._name_label.setGeometry(4, _y, w - 8, LABEL_H)
+        if hasattr(self, '_star_row'):
+            self._position_rating_row()
         if hasattr(self, '_playtime_label'):
             self._playtime_label.move(w - self._playtime_label.width() - 7, 7)
         if hasattr(self, '_hover_overlay') and self._hover_overlay.width() > 0:
@@ -8332,28 +9641,33 @@ class GameCard(QFrame):
         self._play_button_enabled = visible
 
     def enterEvent(self, event):
+        # During a smooth-wheel glide the grid suppresses hover: cards
+        # sweeping under a stationary cursor would ripple half-raised
+        # names otherwise. The grid re-applies hover on glide end via
+        # _apply_hover(). Standalone cards (Edit dialog preview) have no
+        # _gliding parent attribute → always False.
+        if not getattr(self.parentWidget(), "_gliding", False):
+            self._apply_hover()
+        super().enterEvent(event)
+
+    def _apply_hover(self):
+        """Full hover-enter reaction. Called from enterEvent and from the
+        grid's glide-end resync."""
         self._hover_overlay.set_play_visible(False)
         self._hover_overlay.fade_in()
         self._hover_timer.start(300)
-        # Stop auto-hide and show chip while hovering (no timer restart).
-        # Skip entirely if chip is disabled on this card (e.g. dialog cover card).
-        if not getattr(self, "_chip_disabled", False):
-            if hasattr(self, "_chip_timer"):
-                self._chip_timer.stop()
-            self._update_rating_chip(start_timer=False)
-        super().enterEvent(event)
+        # Slide the name up and reveal the editable star row beneath it.
+        self._set_hover_rating(True)
 
     def leaveEvent(self, event):
         self._hover_timer.stop()
         self._hover_overlay.set_play_visible(False)
         # Do not hide the overlay while the context menu is open — the menu
         # opening causes Qt to send leaveEvent which would kill the tint.
+        # Same guard for the star row / raised name.
         if not self._context_menu_open:
             self._hover_overlay.fade_out()
-        # Restart auto-hide timer when cursor leaves if the chip is visible.
-        if hasattr(self, "_chip_timer") and hasattr(self, "_rating_chip") \
-                and self._rating_chip.isVisible():
-            self._chip_timer.start()
+            self._set_hover_rating(False)
         super().leaveEvent(event)
 
     def _build(self):
@@ -8364,6 +9678,11 @@ class GameCard(QFrame):
 
         self._cover_pixmap: QPixmap | None = None
         self._has_cover = False
+        # True when the cover pixmap already contains the bottom scrim gradient
+        # (covers composed off-thread by ThumbnailWorker). paintEvent skips its
+        # runtime gradient draw for these. set_cover()/_set_placeholder() output
+        # has no baked scrim, so both reset this to False.
+        self._gradient_baked = False
         self._cover_w = CARD_W
         self._cover_h = COVER_H
 
@@ -8412,26 +9731,31 @@ class GameCard(QFrame):
             CARD_W - self._playtime_label.width() - 7,
             7,
         )
-        self._playtime_label.setVisible(bool(pt_text))
+        # Tools: badge hidden but minutes still tracked (DB writes untouched)
+        # — Edit Tool keeps showing the value. Gate amended here AND in
+        # update_playtime; a competing setVisible would be reverted.
+        self._playtime_label.setVisible(bool(pt_text) and not self.game.get("is_tool"))
 
-        # ── Rating chip — top-left, read-only ─────────────────────────────
-        # Shares the top-left slot with the running dot and backup pill, which
-        # take priority (they're live status). Shown only when rated and idle.
-        # Transparent to mouse events so it never eats a card click/launch.
-        self._rating_chip = QLabel("", self)
-        self._rating_chip.setObjectName("ratingChip")
-        self._rating_chip.setTextFormat(Qt.TextFormat.RichText)
-        self._rating_chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._rating_chip.setStyleSheet(
-            "background: rgba(10,10,14,0.70); border-radius: 6px; padding: 4px 9px;"
-        )
-        self._rating_chip.hide()
-        # Auto-hide timer — hides the chip after 10 s of no hover.
-        self._chip_timer = QTimer(self)
-        self._chip_timer.setSingleShot(True)
-        self._chip_timer.setInterval(5_000)
-        self._chip_timer.timeout.connect(self._rating_chip.hide)
-        self._update_rating_chip()
+        # ── Hover rating — editable star row at the bottom of the cover ───
+        # Hidden while idle. On hover the name label slides up by _star_lift
+        # and the star row appears beneath it (shown once the slide finishes
+        # so the title never passes through the stars mid-animation).
+        # Left-click sets (half-steps), clicking the current value or
+        # right-clicking clears — all inherited from StarRating. Raised above
+        # the hover overlay in __init__ so it receives mouse events; this makes
+        # the star strip a no-launch / no-context-menu zone while visible.
+        _sr_px = max(16, round(CARD_W * 22 / 185))   # scales with card size
+        self._star_row = StarRating(self.game.get("rating") or 0, star_px=_sr_px, parent=self)
+        self._star_row.hide()
+        self._star_row.rating_changed.connect(self._on_rating_edited)
+        self._star_lift = self._star_row.height() + 2
+        # Name slide animation — retargeted from the current pos on rapid
+        # enter/leave so fast sweeps across the grid never queue or snap.
+        self._name_anim = QPropertyAnimation(self._name_label, b"pos", self)
+        self._name_anim.setDuration(150)
+        self._name_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._name_anim.finished.connect(self._on_name_anim_done)
+        self._name_raised = False   # target state: True = raised (hovering)
 
         # Build placeholder cover
         self._set_placeholder()
@@ -8459,15 +9783,23 @@ class GameCard(QFrame):
             self._cover_w - self._playtime_label.width() - 7,
             7,
         )
-        self._playtime_label.setVisible(bool(text))
+        self._playtime_label.setVisible(bool(text) and not self.game.get("is_tool"))
 
     def update_game_data(self, d: dict):
         """Update card metadata in-place after an edit — no rebuild, no flash."""
         self.game.update(d)
         self._name_label.setText(d.get("name", self.game.get("name", "")))
-        self._update_rating_chip()
+        # Sync the hover star row with a rating edited via the Edit dialog.
+        # blockSignals — setValue emits rating_changed, which would loop back
+        # into a redundant DB write.
+        if hasattr(self, "_star_row"):
+            self._star_row.blockSignals(True)
+            self._star_row.setValue(self.game.get("rating") or 0)
+            self._star_row.blockSignals(False)
+            self._position_rating_row()
 
     def _set_placeholder(self, all_corners: bool = False, size: tuple = None):
+        self._gradient_baked = False  # placeholder has no baked scrim — paintEvent draws it
         # Render at physical pixels — same DPR logic as set_cover.
         screen = self.screen() or QApplication.primaryScreen()
         dpr    = screen.devicePixelRatio() if screen else 1.0
@@ -8497,25 +9829,42 @@ class GameCard(QFrame):
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(0, 0, pw, ph)
 
-        # Game initials — up to 2 chars, centered
-        name = self.game.get("name", "")
-        words = name.split()
-        if len(words) >= 2:
-            initials = (words[0][0] + words[1][0]).upper()
-        elif words:
-            initials = words[0][:2].upper()
-        else:
-            initials = "?"
-
-        font_size = max(12, int(pw * 0.28))
-        font = QFont("Segoe UI", font_size)
-        font.setWeight(QFont.Weight.Bold)
-        p.setFont(font)
+        # Centre mark — tools get a Phosphor wrench glyph (matches the sidebar
+        # Tools icon); games keep their up-to-2-char initials. Same muted colour
+        # and centring for both so the placeholder family reads consistently.
+        # Gated on is_tool so game cards render byte-identical to before.
         p.setPen(QColor("#c4c4cf") if _is_light else QColor("#3a3a42"))
-        fm = QFontMetrics(font)
-        tw = fm.horizontalAdvance(initials)
-        th = fm.height()
-        p.drawText((pw - tw) // 2, (ph - th) // 2 + fm.ascent(), initials)
+        _drew_glyph = False
+        if self.game.get("is_tool"):
+            fam = _ph_family()
+            if fam:
+                gfont = QFont(fam)
+                gfont.setPixelSize(max(12, int(pw * 0.34)))
+                p.setFont(gfont)
+                p.drawText(QRect(0, 0, pw, ph),
+                           Qt.AlignmentFlag.AlignCenter,
+                           chr(PH.get("wrench", 0x0020)))
+                _drew_glyph = True
+        if not _drew_glyph:
+            # Game initials — up to 2 chars, centered (also the fallback if the
+            # Phosphor font failed to load for a tool).
+            name = self.game.get("name", "")
+            words = name.split()
+            if len(words) >= 2:
+                initials = (words[0][0] + words[1][0]).upper()
+            elif words:
+                initials = words[0][:2].upper()
+            else:
+                initials = "?"
+
+            font_size = max(12, int(pw * 0.28))
+            font = QFont("Inter", font_size)
+            font.setWeight(QFont.Weight.Bold)
+            p.setFont(font)
+            fm = QFontMetrics(font)
+            tw = fm.horizontalAdvance(initials)
+            th = fm.height()
+            p.drawText((pw - tw) // 2, (ph - th) // 2 + fm.ascent(), initials)
 
         # Subtle accent line at bottom
         accent = self._accent_color
@@ -8563,7 +9912,17 @@ class GameCard(QFrame):
         self._cover_pixmap = rounded
         self.update()
 
+    def apply_composed_cover(self, img: QImage):
+        """Apply a fully composed cover from ThumbnailWorker — already scaled,
+        corner-rounded, and scrim-baked off-thread. Main-thread cost is one
+        QPixmap.fromImage (DPR tag is preserved by fromImage)."""
+        self._cover_pixmap   = QPixmap.fromImage(img)
+        self._has_cover      = True
+        self._gradient_baked = True
+        self.update()
+
     def set_cover(self, pixmap: QPixmap):
+        self._gradient_baked = False  # this path bakes no scrim — paintEvent draws it
         cw, ch = self._cover_w, self._cover_h
 
         # Use the label's actual rendered pixel size as the scale target.
@@ -8648,7 +10007,7 @@ class GameCard(QFrame):
 
         # ── Card background ───────────────────────────────────────────────
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor(_t("#2a2a30", "#f0f0f4"))))
+        p.setBrush(QBrush(QColor(_t("#2a2a30", "#ececf1"))))
         p.drawRoundedRect(QRectF(0, 0, w, h), r, r)
 
         # ── Cover image ───────────────────────────────────────────────────
@@ -8656,8 +10015,10 @@ class GameCard(QFrame):
             p.drawPixmap(QRect(1, 1, self._cover_w - 2, self._cover_h - 1), self._cover_pixmap)
 
         # ── Cover gradient — dark scrim over bottom of cover for name legibility ──
-        if not getattr(self, '_no_gradient', False):
-            _grad_h = min(70, self._cover_h)
+        # Skipped when the scrim is already baked into the cover pixmap
+        # (ThumbnailWorker path) — drawing it again would double-darken.
+        if not getattr(self, '_no_gradient', False) and not self._gradient_baked:
+            _grad_h = min(86, self._cover_h)
             _grad_y = self._cover_h - _grad_h
             _cg = QLinearGradient(0, _grad_y, 0, self._cover_h)
             _cg.setColorAt(0.0, QColor(0, 0, 0, 0))
@@ -8670,12 +10031,12 @@ class GameCard(QFrame):
         # ── Bottom strip (only when card is taller than cover area) ───────
         strip_h = h - self._cover_h
         if strip_h > 0:
-            p.setBrush(QBrush(QColor(_t("#2a2a30", "#f0f0f4"))))
+            p.setBrush(QBrush(QColor(_t("#2a2a30", "#ececf1"))))
             p.setPen(Qt.PenStyle.NoPen)
             p.drawRect(QRect(0, self._cover_h, w, strip_h))
 
         # ── Border ────────────────────────────────────────────────────────
-        pen = QPen(QColor(_t("#3d3d44", "#d4d4d8")), 1.5)
+        pen = QPen(QColor(_t("#3d3d44", "#c8c8d0")), 1.5)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -8704,44 +10065,88 @@ class GameCard(QFrame):
         self._backup_pill.move(7, 7)
         self._backup_pill.show()
         self._backup_pill.raise_()
-        if hasattr(self, "_rating_chip"):
-            self._rating_chip.hide()
         delay = {"success": 3000, "failed": 5000}.get(state, 0)
         if delay:
             QTimer.singleShot(delay, self._dismiss_backup_pill)
 
     def _dismiss_backup_pill(self):
-        """Hide the backup pill and restore the rating chip if one is due."""
+        """Hide the backup pill."""
         self._backup_pill.hide()
-        self._update_rating_chip()
 
-    def _update_rating_chip(self, start_timer: bool = True):
-        """Show the read-only rating chip top-left, but only when the game is
-        rated and the slot isn't claimed by the running dot or backup pill."""
-        if not hasattr(self, "_rating_chip") or getattr(self, "_chip_disabled", False):
+    # ── Hover rating helpers ───────────────────────────────────────────────
+
+    def _name_rest_y(self) -> int:
+        """Resting y of the name label (today's bottom-anchored position)."""
+        return self.height() - 64 - 8   # LABEL_H, LABEL_BOTTOM_OFFSET
+
+    def _position_rating_row(self):
+        """Center the star row at the bottom of the cover. Called on resize."""
+        w = self.width()
+        LABEL_BOTTOM_OFFSET = 8
+        y = self.height() - self._star_row.height() - LABEL_BOTTOM_OFFSET
+        self._star_row.move((w - self._star_row.width()) // 2, y)
+
+    def _set_hover_rating(self, up: bool):
+        """Slide the name label up/down and show/hide the star row.
+        Stars appear only after the upward slide finishes; they hide
+        immediately on the way down so the title never crosses them.
+        Interaction stays locked (StarRating.setArmed(False)) until
+        _STAR_ARM_DELAY of hover dwell, so a passing hover never edits."""
+        if not hasattr(self, "_star_row"):
             return
-        r = StarRating._snap(self.game.get("rating") or 0)
-        if r <= 0 or self.is_running or self._backup_pill.isVisible():
-            self._rating_chip.hide()
+        enabled = self._show_rating and not getattr(self, "_chip_disabled", False)
+        if up and not enabled:
             return
-        fill_fam = _ph_fill_family() or _ph_family()
-        star = chr(PH.get("star", 0x0020))
-        col = _star_fill_color()
-        num = f"{r:g}"
-        _icon_px, _text_px, _pad_v, _pad_h, _radius = _pill_sizes()
-        self._rating_chip.setStyleSheet(
-            f"background: rgba(10,10,14,0.70); border-radius: {_radius}px;"
-            f" padding: {_pad_v}px {_pad_h}px;"
-        )
-        self._rating_chip.setText(
-            f"<span style='font-family:{fill_fam}; font-size:{_icon_px}px; color:{col};'>{star}</span>"
-            f"<span style='font-size:{_text_px}px; font-weight:600; color:{col};'> {num}</span>"
-        )
-        self._rating_chip.adjustSize()
-        self._rating_chip.move(7, 7)
-        self._rating_chip.show()
-        if start_timer and hasattr(self, "_chip_timer"):
-            self._chip_timer.start()
+        self._name_raised = up and enabled
+        if not self._name_raised:
+            self._star_row.hide()
+            self._star_row.setArmed(False)
+            self._star_arm_timer.stop()
+        target_y = self._name_rest_y() - (self._star_lift if self._name_raised else 0)
+        cur = self._name_label.pos()
+        if cur.y() == target_y:
+            self._on_name_anim_done()
+            return
+        self._name_anim.stop()
+        self._name_anim.setStartValue(cur)
+        self._name_anim.setEndValue(QPoint(4, target_y))
+        self._name_anim.start()
+
+    def _on_name_anim_done(self):
+        """Reveal the star row once the name finishes sliding up, and start
+        the arm-delay countdown before clicks are accepted."""
+        if self._name_raised and self._star_row is not None:
+            self._position_rating_row()
+            self._star_row.show()
+            self._star_row.raise_()
+            self._star_arm_timer.start()
+
+    def _on_rating_edited(self, value: float):
+        """Persist a rating set/cleared directly on the card's star row."""
+        self.game["rating"] = value
+        gid = self.game.get("id")
+        if gid is None:
+            return
+        try:
+            con = db_con()
+            con.execute("UPDATE games SET rating=? WHERE id=?", (value, gid))
+            con.commit()
+            con.close()
+        except Exception as e:
+            _NAGOLog.session(f"[warn] card rating write failed for id={gid}: {e}")
+
+    def update_show_rating(self, visible: bool):
+        """Live-apply the Settings 'Show rating' checkbox to this card."""
+        self._show_rating = bool(visible)
+        if not self._show_rating:
+            self._name_anim.stop()
+            self._name_raised = False
+            self._star_row.hide()
+            self._star_row.setArmed(False)
+            self._star_arm_timer.stop()
+            self._name_label.move(4, self._name_rest_y())
+        elif self.underMouse():
+            self._set_hover_rating(True)
 
     def set_running(self, running: bool):
         """Show or hide the green 'Running' badge; hide playtime while running."""
@@ -8751,13 +10156,15 @@ class GameCard(QFrame):
             self._running_dot.show()
             self._running_dot.raise_()
             self._playtime_label.hide()
-            self._rating_chip.hide()
         else:
             self._running_dot.hide()
-            # Only restore playtime if there's something to show
-            if format_playtime(self.game.get("playtime_minutes") or 0):
+            # Only restore playtime if there's something to show — and never on
+            # tools. Mirrors the is_tool guard at the init/update_playtime sites;
+            # without it, set_running(False) after a tool exits resurrects the
+            # badge that those sites correctly suppressed.
+            if (format_playtime(self.game.get("playtime_minutes") or 0)
+                    and not self.game.get("is_tool")):
                 self._playtime_label.show()
-            self._update_rating_chip()
         # Play button should not appear while the game is already running
         self._hover_overlay.set_running(running)
 
@@ -8791,6 +10198,10 @@ class GameCard(QFrame):
                             | Qt.WindowType.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         menu.setStyleSheet(_menu_stylesheet())
+        # Menu-level hover corrector — keeps active action + submenu title
+        # highlights tracking the cursor even while a submenu popup owns the
+        # mouse grab (fast travel between submenu titles). See _MenuHoverSync.
+        _MenuHoverSync(menu)
 
         _running = self.is_running
 
@@ -8805,19 +10216,21 @@ class GameCard(QFrame):
         menu.addAction(edit_act)
         cover_act,  cover_row  = _make_menu_row(menu, "image",         "Get Cover Art")
         menu.addAction(cover_act)
-        cat_act,    cat_row    = _make_menu_row(menu, "tag",            "Assign Categories")
-        menu.addAction(cat_act)
+        # Assign Categories is meaningless on a tool card: the category
+        # sidebar only filters the Library (is_tool=0), so an assignment
+        # would be a silent no-op. cat_act=None keeps the handler branch
+        # safe (== None never matches a menu action).
+        cat_act = None
+        if not self.game.get("is_tool"):
+            cat_act, cat_row = _make_menu_row(menu, "tag", "Assign Categories")
+            menu.addAction(cat_act)
         log_act,    log_row    = _make_menu_row(menu, "scroll",         "Show Log")
         menu.addAction(log_act)
-        menu.addSeparator()
+        # Hide + Remove are appended at the END of the menu, after the Open /
+        # Prefix submenus — destructive actions last.
         _is_hidden = bool(self.game.get("hidden", 0))
         hide_label = "Unhide" if _is_hidden else "Hide"
         hide_icon  = "eye"    if _is_hidden else "eye-slash"
-        hide_act,   hide_row   = _make_menu_row(menu, hide_icon, hide_label)
-        menu.addAction(hide_act)
-        menu.addSeparator()
-        del_act,    del_row    = _make_menu_row(menu, "trash",          "Remove",         disabled=_running)
-        menu.addAction(del_act)
 
         # Open Saves Backup — only shown when a backup folder exists on disk.
         open_bk_act = None
@@ -8855,54 +10268,41 @@ class GameCard(QFrame):
         del_pfx_act  = None
         _pfx         = None
         if _gt in ("proton", "gog"):
-            _pfx_override = (self.game.get("prefix_path") or "").strip()
-            if _pfx_override and Path(_pfx_override).exists():
-                _pfx = Path(_pfx_override)
-            else:
-                if _pfx_override and not Path(_pfx_override).exists():
-                    try:
-                        _con = db_con()
-                        _con.execute("UPDATE games SET prefix_path='' WHERE id=?",
-                                     (self.game["id"],))
-                        _con.commit()
-                        _con.close()
-                        self.game["prefix_path"] = ""
-                    except Exception as e:
-                        _NAGOLog.session(f"[warn] contextMenuEvent: failed to clear stale prefix_path for game {self.game.get('id')}: {e}")
-                _slug    = slugify(self.game.get("name", ""))
-                _gid     = self.game["id"]
-                _derived = get_prefixes_root() / f"{_slug}_{_gid}"
-                if _derived.exists():
-                    _pfx = _derived
-                else:
-                    _root = get_prefixes_root()
-                    _prefix = f"{_slug}_"
-                    _matches = [p for p in (_root.iterdir() if _root.exists() else [])
-                                if p.is_dir() and p.name.startswith(_prefix)]
-                    if len(_matches) == 1:
-                        _pfx = _matches[0]
-                        try:
-                            _con = db_con()
-                            _con.execute("UPDATE games SET prefix_path=? WHERE id=?",
-                                         (str(_pfx), _gid))
-                            _con.commit()
-                            _con.close()
-                            self.game["prefix_path"] = str(_pfx)
-                        except Exception as e:
-                            _NAGOLog.session(f"[warn] contextMenuEvent: failed to persist prefix_path for game {_gid}: {e}")
+            _pfx = resolve_prefix(self.game, persist=False)
 
-        # One separator for the whole folder group
-        _has_folder_group = bool(_bk_folder) or bool(_game_folder) or _gt in ("proton", "gog")
-        if _has_folder_group:
+        # ── "Open" submenu — game folder / saves backup / store page ─────
+        # Styled child QMenu; title row via _make_submenu_row (native
+        # addMenu() items are collapsed to 0px by _menu_stylesheet).
+        def _mk_sub() -> QMenu:
+            sub = QMenu(menu)
+            sub.setWindowFlags(sub.windowFlags()
+                               | Qt.WindowType.FramelessWindowHint
+                               | Qt.WindowType.NoDropShadowWindowHint)
+            sub.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            sub.setStyleSheet(_menu_stylesheet())
+            return sub
+
+        _store_url = (self.game.get("store_url") or "").strip()
+        open_store_act = None
+        _has_open_group = bool(_bk_folder) or bool(_game_folder) or bool(_store_url)
+        if _has_open_group or _gt in ("proton", "gog"):
             menu.addSeparator()
-
-        if _game_folder:
-            open_folder_act, _ = _make_menu_row(menu, "folder-open", "Open Game Folder")
-            menu.addAction(open_folder_act)
-
-        if _bk_folder:
-            open_bk_act, _ = _make_menu_row(menu, "floppy-disk", "Open Saves Backup")
-            menu.addAction(open_bk_act)
+        if _has_open_group:
+            open_sub = _mk_sub()
+            if _game_folder:
+                open_folder_act, _ = _make_menu_row(
+                    open_sub, "folder-open",
+                    "Tool Folder" if self.game.get("is_tool") else "Game Folder",
+                    hover_sync=False)
+                open_sub.addAction(open_folder_act)
+            if _bk_folder:
+                open_bk_act, _ = _make_menu_row(open_sub, "floppy-disk", "Saves Backup", hover_sync=False)
+                open_sub.addAction(open_bk_act)
+            if _store_url:
+                open_store_act, _ = _make_menu_row(open_sub, "globe", "Store Page", hover_sync=False)
+                open_sub.addAction(open_store_act)
+            open_title_act, _ = _make_submenu_row(menu, "folder-open", "Open", open_sub)
+            menu.addAction(open_title_act)
 
         # Prefix-tools sub-group: Run File in Prefix is shown for any
         # proton/gog game regardless of whether the prefix exists yet —
@@ -8912,20 +10312,30 @@ class GameCard(QFrame):
         # rather than a second always-visible row (no extra information is
         # conveyed by keeping a disabled "Run" row visible underneath an
         # active "Stop" one).
+        # ── "Prefix" submenu — run/open/delete, proton & gog only ─────────
         run_pfx_act = None
         if _gt in ("proton", "gog"):
-            if _game_folder or _bk_folder:
-                menu.addSeparator()
+            pfx_sub = _mk_sub()
             if self.is_prefix_running:
-                run_pfx_act, run_pfx_row = _make_menu_row(menu, "x-circle", "Stop Run in Prefix")
+                run_pfx_act, run_pfx_row = _make_menu_row(pfx_sub, "x-circle", "Stop Run in Prefix", hover_sync=False)
             else:
-                run_pfx_act, run_pfx_row = _make_menu_row(menu, "file-archive", "Run File in Prefix")
-            menu.addAction(run_pfx_act)
+                run_pfx_act, run_pfx_row = _make_menu_row(pfx_sub, "file-archive", "Run File in Prefix", hover_sync=False)
+            pfx_sub.addAction(run_pfx_act)
             if _pfx and _pfx.exists():
-                open_pfx_act, open_pfx_row = _make_menu_row(menu, "app-window", "Open Prefix")
-                menu.addAction(open_pfx_act)
-                del_pfx_act, del_pfx_row = _make_menu_row(menu, "x", "Delete Prefix", disabled=_running)
-                menu.addAction(del_pfx_act)
+                open_pfx_act, open_pfx_row = _make_menu_row(pfx_sub, "app-window", "Open Prefix", hover_sync=False)
+                pfx_sub.addAction(open_pfx_act)
+                del_pfx_act, del_pfx_row = _make_menu_row(pfx_sub, "x", "Delete Prefix", disabled=_running, hover_sync=False)
+                pfx_sub.addAction(del_pfx_act)
+            pfx_title_act, _ = _make_submenu_row(menu, "wrench", "Prefix", pfx_sub)
+            menu.addAction(pfx_title_act)
+
+        # ── Hide / Remove — destructive actions last ───────────────────────
+        menu.addSeparator()
+        hide_act,   hide_row   = _make_menu_row(menu, hide_icon, hide_label)
+        menu.addAction(hide_act)
+        menu.addSeparator()
+        del_act,    del_row    = _make_menu_row(menu, "trash",          "Remove",         disabled=_running)
+        menu.addAction(del_act)
 
         # Show accent outline + tint while the menu is open.
         # Two entry paths:
@@ -8943,11 +10353,14 @@ class GameCard(QFrame):
 
         self._context_menu_open = False
         # If the cursor is still over the card, enterEvent won't re-fire —
-        # restore the hover state manually; otherwise hide the overlay.
+        # restore the hover state manually; otherwise hide the overlay and
+        # lower the name / hide the star row.
         if self.underMouse():
             self._hover_overlay.fade_in()
+            self._set_hover_rating(True)
         else:
             self._hover_overlay.fade_out()
+            self._set_hover_rating(False)
 
         if action == launch_act and not _running:
             self.launch_requested.emit(self.game)
@@ -8955,7 +10368,7 @@ class GameCard(QFrame):
             self.force_terminate_requested.emit(self.game)
         elif action == cover_act:
             self.cover_requested.emit(self.game)
-        elif action == cat_act:
+        elif cat_act and action == cat_act:
             self.categories_requested.emit(self.game)
         elif action == edit_act and not _running:
             self.edit_requested.emit(self.game)
@@ -8969,6 +10382,8 @@ class GameCard(QFrame):
             subprocess.Popen(["xdg-open", _game_folder])
         elif open_bk_act and action == open_bk_act:
             subprocess.Popen(["xdg-open", str(_bk_folder)])
+        elif open_store_act and action == open_store_act:
+            subprocess.Popen(["xdg-open", _store_url])
         elif run_pfx_act and action == run_pfx_act:
             if self.is_prefix_running:
                 self.stop_prefix_run_requested.emit(self.game)
@@ -8983,8 +10398,8 @@ class GameCard(QFrame):
 def _menu_stylesheet() -> str:
     """Return the QMenu stylesheet for the current theme."""
     bg  = _t("#2a2a30", "#ffffff")
-    bdr = _t("#424248", "#d4d4d8")
-    sep = _t("#3a3a42", "#e0e0e4")
+    bdr = _t("#424248", "#c8c8d0")
+    sep = _t("#3a3a42", "#cfcfd7")
     return (
         f"QMenu {{ background: {bg}; border: 1px solid {bdr}; border-radius: 8px; padding: 4px; }}"
         f"QMenu::item {{ height: 0px; padding: 0px; }}"
@@ -8992,10 +10407,15 @@ def _menu_stylesheet() -> str:
     )
 
 
-def _make_menu_row(menu: "QMenu", icon_name: str, label: str, disabled: bool = False):
+def _make_menu_row(menu: "QMenu", icon_name: str, label: str, disabled: bool = False,
+                   hover_sync: bool = True):
     """Build a QWidgetAction with a Phosphor icon + text row for custom context menus.
     Returns (QWidgetAction, row_widget). Bypasses Qt/KDE icon column sizing.
-    Pass disabled=True to render the row dimmed and non-interactive."""
+    Pass disabled=True to render the row dimmed and non-interactive.
+    Pass hover_sync=False for rows INSIDE submenus — they must not call
+    setActiveAction (two menu levels poking active-action state fight each
+    other and Qt's sloppy timers, causing stuck/undrawn hover highlights);
+    their QSS :hover styling is sufficient since submenus never nest."""
     from PyQt6.QtWidgets import QWidgetAction
     row = QWidget()
     row.setObjectName("menuRow")
@@ -9027,18 +10447,134 @@ def _make_menu_row(menu: "QMenu", icon_name: str, label: str, disabled: bool = F
     hl.addStretch()
     wa = QWidgetAction(menu)
     wa.setDefaultWidget(row)
+    # Sync QMenu's internal current-action with the row under the cursor.
+    # Widget rows swallow the mouse-moves QMenu's own hover tracking needs,
+    # so without this (a) submenus attached via wa.setMenu() never open on
+    # hover, and (b) an open submenu wouldn't close when hovering a sibling
+    # row. setActiveAction on a plain action is a harmless no-op visually
+    # (native item highlight is collapsed to 0px by _menu_stylesheet).
+    if not disabled and hover_sync:
+        def _row_enter(e, m=menu, a=wa):
+            m.setActiveAction(a)
+            # Sync submenu-title highlights against the entered action (see
+            # _make_submenu_row — title highlight is explicit, not :hover,
+            # because the submenu popup steals the grab and kills :hover the
+            # instant it opens).
+            for _sync in getattr(m, "_nago_sub_syncers", []):
+                _sync(a)
+        row.enterEvent = _row_enter
     return wa, row
+
+
+def _make_submenu_row(menu: "QMenu", icon_name: str, label: str, submenu: "QMenu"):
+    """Build a _make_menu_row-styled row that opens `submenu` on hover/click.
+    The native QMenu::addMenu() title item is unusable here — _menu_stylesheet
+    collapses native items to 0px height — so the title is a widget row with
+    a caret-right glyph and the submenu attached via QAction.setMenu().
+
+    Highlight is EXPLICIT, not QSS :hover: the submenu popup grabs the mouse
+    the moment it opens, sending this row a Leave that kills :hover after one
+    frame. Instead the row lights on enter, stays lit while its submenu is
+    open (native menu behavior), and clears when another parent row is
+    entered (via menu._nago_sub_syncers) or the menu hides.
+    Returns (QWidgetAction, row_widget)."""
+    wa, row = _make_menu_row(menu, icon_name, label)
+    # Caret at the right edge, after the stretch added by _make_menu_row.
+    _caret = ph_label("caret-right", 12, _t("#a1a1aa", "#71717a"))
+    _caret.setFixedSize(14, 14)
+    _caret.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    row.layout().addWidget(_caret)
+    wa.setMenu(submenu)
+
+    _hover_bg = _t("#3d3d42", "#f0f0f4")
+    _base_ss  = row.styleSheet()
+
+    def _set_hl(on: bool):
+        if on:
+            row.setStyleSheet(
+                f"QWidget#menuRow {{ background: {_hover_bg};"
+                f" border-radius: 4px; padding: 0px; }}"
+            )
+        else:
+            row.setStyleSheet(_base_ss)
+
+    # Registered syncers run with the currently-hovered action (from row
+    # enter hooks AND the menu-level _MenuHoverSync filter): light this row
+    # iff it is the active one. Idempotent — safe to fire from both paths.
+    _syncers = getattr(menu, "_nago_sub_syncers", [])
+    _syncers.append(lambda a, w=wa: _set_hl(a is w))
+    menu._nago_sub_syncers = _syncers
+    menu.aboutToHide.connect(lambda: _set_hl(False))
+    return wa, row
+
+
+class _MenuHoverSync(QObject):
+    """Menu-level hover corrector for menus with widget-action rows.
+
+    While a submenu popup is open it owns the mouse grab, and enter/leave
+    delivery to the parent menu's child row widgets becomes unreliable —
+    fast pointer travel from one submenu title to another never fires the
+    second row's enterEvent, so the first stays lit and active. The parent
+    QMenu itself DOES still receive mouse moves in that state (Qt's popup
+    forwarding — the same channel native sloppy switching uses), so this
+    filter maps MouseMove → actionAt(pos) and drives the same idempotent
+    sync the row hooks use."""
+
+    def __init__(self, menu: "QMenu"):
+        super().__init__(menu)
+        self._menu = menu
+        menu.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.MouseMove:
+            act = self._menu.actionAt(ev.position().toPoint())
+            if act is not None and act is not self._menu.activeAction():
+                self._menu.setActiveAction(act)
+                for _sync in getattr(self._menu, "_nago_sub_syncers", []):
+                    _sync(act)
+        return False
 
 
 # ── Combo separator delegate ───────────────────────────────────────────────────
 # Qt's QAbstractItemView::separator QSS rule is unreliable on Linux — the style
 # engine often ignores it entirely. This delegate draws separators manually.
 # ── Custom ComboBox with styled popup ─────────────────────────────────────────
+class _ComboItemLabel(QLabel):
+    """Popup item row — a QLabel that additionally paints an accent checkmark
+    on the right when it represents the combo's current selection. Painted, not
+    a glyph, so it stays crisp at any DPR and needs no font lookups."""
+    def __init__(self, text: str, checked: bool = False):
+        super().__init__(text)
+        self._checked = checked
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._checked:
+            return
+        accent = QApplication.instance().property("nagoAccent") or "#4ade80"
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(accent), 2,
+                      Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
+        cx = self.width() - 18
+        cy = self.height() // 2
+        path = QPainterPath()
+        path.moveTo(cx - 5, cy)
+        path.lineTo(cx - 1.5, cy + 3.5)
+        path.lineTo(cx + 5, cy - 4)
+        p.drawPath(path)
+        p.end()
+
+
 class _NAGOComboPopup(QFrame):
     """Floating popup for NAGOComboBox — rounded, dark, matches option-C mockup."""
     item_selected = pyqtSignal(int)  # model row index
 
     _SHADOW = 8  # shadow radius in pixels
+    _ROW_H = 36  # item row height (px)
+    _MAX_ROWS = 12  # visible item rows before the popup starts scrolling
 
     def __init__(self, combo: "NAGOComboBox"):
         super().__init__(combo.window(), Qt.WindowType.Popup)
@@ -9049,8 +10585,37 @@ class _NAGOComboPopup(QFrame):
         lyt = QVBoxLayout(self)
         lyt.setContentsMargins(s, s + 2, s, s)
         lyt.setSpacing(0)
+        # Rows live inside a scroll area so a long list (games + tools + steam +
+        # customs) can't grow taller than the screen. Under _MAX_ROWS the
+        # scrollbar never appears and it looks identical to a plain popup.
+        self._scroll = QScrollArea(self)
+        self._scroll.setObjectName("transparentBg")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._content = QWidget()
+        self._content.setObjectName("transparentBg")
+        self._clyt = QVBoxLayout(self._content)
+        # Horizontal inset so hover/selection pills sit inside the frame edge
+        # (replaces the old per-item "margin: 0 4px" stylesheet hack).
+        self._clyt.setContentsMargins(6, 2, 6, 2)
+        self._clyt.setSpacing(0)
+        self._scroll.setWidget(self._content)
+        lyt.addWidget(self._scroll)
+        self._smooth = NAGOSmoothScroller(self._scroll)
         self._rows: list[QWidget] = []
         self._build()
+
+    def hideEvent(self, event):
+        # A Qt.Popup hides itself on outside-click, and item clicks call
+        # self.hide() directly — neither goes through combo.hidePopup(), so
+        # notify the combo here to un-flip the chevron / drop the open border.
+        try:
+            self._combo._set_open(False)
+        except RuntimeError:
+            pass  # combo already destroyed
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         s = self._SHADOW
@@ -9068,14 +10633,13 @@ class _NAGOComboPopup(QFrame):
         path = QPainterPath()
         path.addRoundedRect(rect, 10, 10)
         painter.fillPath(path, QColor(_t("#2a2a30", "#ffffff")))
-        painter.setPen(QPen(QColor(_t("#3d3d43", "#d4d4d8")), 1))
+        painter.setPen(QPen(QColor(_t("#3d3d43", "#c8c8d0")), 1))
         painter.drawPath(path)
         painter.end()
 
     def _build(self):
         combo = self._combo
         model = combo.model()
-        accent = QApplication.instance().property("nagoAccent") or "#4ade80"
         self._focusable: list[int] = []  # model rows that are selectable
         for row in range(model.rowCount()):
             idx = model.index(row, 0)
@@ -9088,26 +10652,25 @@ class _NAGOComboPopup(QFrame):
                 line.setFrameShape(QFrame.Shape.HLine)
                 line.setObjectName("comboSepLine")
                 line.setGeometry(8, 4, 9999, 1)
-                self.layout().addWidget(sep)
+                self._clyt.addWidget(sep)
                 self._rows.append(None)
             else:
                 text = idx.data(Qt.ItemDataRole.DisplayRole) or ""
                 is_cur = (row == combo.currentIndex())
                 is_disabled = not (model.flags(idx) & Qt.ItemFlag.ItemIsEnabled)
-                item = QLabel(text)
-                item.setContentsMargins(12, 7, 12, 7)
-                item.setFixedHeight(34)
+                item = _ComboItemLabel(text, checked=is_cur)
+                # Right margin reserves the checkmark zone on every row so text
+                # alignment is uniform and never underlaps the check.
+                item.setContentsMargins(12, 7, 30, 7)
+                item.setFixedHeight(self._ROW_H)
                 if is_disabled:
                     item.setObjectName("comboItemDisabled")
-                elif is_cur:
-                    item.setObjectName("comboItemCurrent")
-                    item.setStyleSheet(f"color: {accent}; font-size: 13px; background: transparent;")
                 else:
-                    item.setObjectName("comboItemNormal")
+                    item.setStyleSheet(self._item_style(is_cur, False))
                 item.setProperty("row", row)
                 item.setProperty("disabled", is_disabled)
                 item.installEventFilter(self)
-                self.layout().addWidget(item)
+                self._clyt.addWidget(item)
                 self._rows.append(item)
                 if not is_disabled:
                     self._focusable.append(row)
@@ -9116,21 +10679,37 @@ class _NAGOComboPopup(QFrame):
         cur = combo.currentIndex()
         self._kbd_row = cur if cur in self._focusable else (self._focusable[0] if self._focusable else -1)
 
-    def _set_kbd_highlight(self, row: int):
-        """Move keyboard highlight to the given row."""
+    def _item_style(self, is_cur: bool, is_kbd: bool) -> str:
+        """One source of truth for popup item inline styles (current-selection
+        accent pill, keyboard/hover pill, plain). Previously triplicated across
+        _build / _set_kbd_highlight / eventFilter with drift risk."""
         accent = QApplication.instance().property("nagoAccent") or "#4ade80"
+        col = accent if is_cur else _t("#e4e4e7", "#18181b")
+        if is_kbd:
+            return (f"color: {col}; font-size: 14px; "
+                    f"background: {_t('#3d3d42', '#e8e8ec')}; border-radius: 6px;")
+        if is_cur:
+            c = QColor(accent)
+            return (f"color: {accent}; font-size: 14px; "
+                    f"background: rgba({c.red()}, {c.green()}, {c.blue()}, 26); "
+                    f"border-radius: 6px;")
+        return f"color: {col}; font-size: 14px; background: transparent; border-radius: 0;"
+
+    def _set_kbd_highlight(self, row: int):
+        """Move keyboard highlight to the given row and scroll it into view."""
+        target = None
         for item in self._rows:
-            if item is None:
+            if item is None or item.property("disabled"):
                 continue
             r = item.property("row")
             is_cur = (r == self._combo.currentIndex())
             is_kbd = (r == row)
             if is_kbd:
-                item.setStyleSheet(f"color: {_t('#e4e4e7', '#18181b') if not is_cur else accent}; font-size: 13px; background: {_t('#3d3d42', '#e8e8ec')}; border-radius: 6px; margin: 0 4px;")
-            else:
-                col = accent if is_cur else _t('#e4e4e7', '#18181b')
-                item.setStyleSheet(f"color: {col}; font-size: 13px; background: transparent; border-radius: 0; margin: 0;")
+                target = item
+            item.setStyleSheet(self._item_style(is_cur, is_kbd))
         self._kbd_row = row
+        if target is not None:
+            self._scroll.ensureWidgetVisible(target, 0, 0)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Enter and not obj.property("disabled"):
@@ -9138,10 +10717,8 @@ class _NAGOComboPopup(QFrame):
             self._set_kbd_highlight(row)
         elif event.type() == QEvent.Type.Leave and not obj.property("disabled"):
             row = obj.property("row")
-            accent = QApplication.instance().property("nagoAccent") or "#4ade80"
             is_cur = (row == self._combo.currentIndex())
-            col = accent if is_cur else _t("#e4e4e7", "#18181b")
-            obj.setStyleSheet(f"color: {col}; font-size: 13px; background: transparent; border-radius: 0; margin: 0;")
+            obj.setStyleSheet(self._item_style(is_cur, False))
         elif event.type() == QEvent.Type.MouseButtonPress and not obj.property("disabled"):
             self.item_selected.emit(obj.property("row"))
             self.hide()
@@ -9170,6 +10747,11 @@ class _NAGOComboPopup(QFrame):
         s = self._SHADOW
         gpos = combo.mapToGlobal(combo.rect().bottomLeft())
         self.setFixedWidth(combo.width() + s * 2)
+        # Clamp the scroll viewport to _MAX_ROWS item-heights (34px each). Under
+        # the cap it shows everything with no scrollbar; over it, the list
+        # scrolls and the popup height stops growing.
+        content_h = self._content.sizeHint().height()
+        self._scroll.setFixedHeight(min(content_h, self._MAX_ROWS * self._ROW_H))
         self.adjustSize()
         self.move(gpos.x() - s, gpos.y() - s + 2)
         self.show()
@@ -9179,15 +10761,6 @@ class _NAGOComboPopup(QFrame):
             item = self._rows[self._kbd_row]
             if item:
                 self._set_kbd_highlight(self._kbd_row)
-
-    def wheelEvent(self, event):
-        if not self._focusable:
-            return
-        idx = self._focusable.index(self._kbd_row) if self._kbd_row in self._focusable else 0
-        if event.angleDelta().y() < 0 and idx < len(self._focusable) - 1:
-            self._set_kbd_highlight(self._focusable[idx + 1])
-        elif event.angleDelta().y() > 0 and idx > 0:
-            self._set_kbd_highlight(self._focusable[idx - 1])
 
 
 class _AdaptiveStack(QStackedWidget):
@@ -9212,28 +10785,47 @@ class NAGOComboBox(QComboBox):
         super().__init__(parent)
         self.setObjectName("dlgCombo")
         self._popup: _NAGOComboPopup | None = None
+        self._open = False  # popup visible — drives chevron flip + QSS border
 
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Divider line before drop zone
-        x = self.width() - 28
-        painter.setPen(QPen(QColor("#333338"), 1))
-        painter.drawLine(x, 6, x, self.height() - 6)
-        # Chevron: two lines forming a V
-        cx = x + 14
+        # Chevron only — no divider line (dated). Bolder 2px stroke; flips to
+        # point up and takes the accent color while the popup is open; brightens
+        # on hover. Colors are theme-aware via _t().
+        if self._open:
+            accent = QApplication.instance().property("nagoAccent") or "#4ade80"
+            col = QColor(accent)
+        elif self.underMouse() and self.isEnabled():
+            col = QColor(_t("#c8c8d0", "#3d3d46"))
+        else:
+            col = QColor(_t("#9a9aa5", "#6b6b75"))
+        cx = self.width() - 18
         cy = self.height() // 2
-        painter.setPen(QPen(QColor("#6b6b75"), 1.5,
+        painter.setPen(QPen(col, 2,
                             Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap,
                             Qt.PenJoinStyle.RoundJoin))
+        d = -1 if self._open else 1  # flip vertically when open
         path = QPainterPath()
-        path.moveTo(cx - 4, cy - 2)
-        path.lineTo(cx,     cy + 2)
-        path.lineTo(cx + 4, cy - 2)
+        path.moveTo(cx - 4.5, cy - 2 * d)
+        path.lineTo(cx,       cy + 2 * d)
+        path.lineTo(cx + 4.5, cy - 2 * d)
         painter.drawPath(path)
         painter.end()
+
+    def _set_open(self, is_open: bool):
+        """Track popup visibility: repaint the chevron and flip the comboOpen
+        dynamic property so QSS can show an accent border while open."""
+        if self._open == is_open:
+            return
+        self._open = is_open
+        self.setProperty("comboOpen", is_open)
+        st = self.style()
+        st.unpolish(self)
+        st.polish(self)
+        self.update()
 
     def showPopup(self):
         if self._popup:
@@ -9241,11 +10833,13 @@ class NAGOComboBox(QComboBox):
             self._popup.deleteLater()
         self._popup = _NAGOComboPopup(self)
         self._popup.item_selected.connect(self._on_item_selected)
+        self._set_open(True)
         self._popup.showUnder(self)
 
     def hidePopup(self):
         if self._popup:
             self._popup.hide()
+        self._set_open(False)
         super().hidePopup()
 
     def _on_item_selected(self, row: int):
@@ -9390,7 +10984,8 @@ class ProtonComboBox(QWidget):
             cw_layout.setSpacing(6)
             cw_layout.addWidget(self.custom_input)
             cw_layout.addWidget(self._browse_btn)
-            self.custom_widget.setVisible(False)
+            self.custom_input.setEnabled(False)
+            self._browse_btn.setEnabled(False)
             layout.addWidget(self.custom_widget)
 
         # ── Hint label (vertical mode only — horizontal mode uses a pill in the card header) ──
@@ -9442,7 +11037,6 @@ class ProtonComboBox(QWidget):
         self._custom_side.setGraphicsEffect(effect)
 
     def _set_current(self, path: str):
-        was_visible = self.custom_widget.isVisible() if not self._horizontal else None
         if not path:
             # No saved Proton → select the "GE-Proton (auto · latest)" item, because an
             # empty/legacy value floors to GE-Proton at launch. Selecting index 0
@@ -9459,7 +11053,8 @@ class ProtonComboBox(QWidget):
             if self._horizontal:
                 self._set_custom_side_active(False)
             else:
-                self.custom_widget.setVisible(False)
+                self.custom_input.setEnabled(False)
+                self._browse_btn.setEnabled(False)
         else:
             matched = False
             for i in range(self.combo.count()):
@@ -9468,7 +11063,8 @@ class ProtonComboBox(QWidget):
                     if self._horizontal:
                         self._set_custom_side_active(False)
                     else:
-                        self.custom_widget.setVisible(False)
+                        self.custom_input.setEnabled(False)
+                        self._browse_btn.setEnabled(False)
                     matched = True
                     break
             if not matched:
@@ -9477,9 +11073,8 @@ class ProtonComboBox(QWidget):
                 if self._horizontal:
                     self._set_custom_side_active(True)
                 else:
-                    self.custom_widget.setVisible(True)
-        if not self._horizontal and self.custom_widget.isVisible() != was_visible:
-            self.size_changed.emit()
+                    self.custom_input.setEnabled(True)
+                    self._browse_btn.setEnabled(True)
 
     def _on_combo_change(self, idx):
         if self.combo.itemData(idx) is None:
@@ -9489,10 +11084,8 @@ class ProtonComboBox(QWidget):
         if self._horizontal:
             self._set_custom_side_active(is_custom)
         else:
-            was_visible = self.custom_widget.isVisible()
-            self.custom_widget.setVisible(is_custom)
-            if is_custom != was_visible:
-                self.size_changed.emit()
+            self.custom_input.setEnabled(is_custom)
+            self._browse_btn.setEnabled(is_custom)
 
     def _browse(self):
         # Dedicated key, not the shared last_browse_dir — Proton installs
@@ -9841,12 +11434,271 @@ def _format_last_played(last_played: str) -> str:
 _DETACHED_COVER_WORKERS: "set" = set()
 
 
+# ── Installed-exe detection (Stage 3a) ───────────────────────────────────────
+# After a Proton install finishes, diff the prefix's .exe set to find what the
+# installer added, so the user doesn't have to hunt through Program Files for
+# the launch exe. Deterministic — filesystem only, no registry, no .lnk parsing.
+
+# Path-level: match anywhere in the relative path (directory names). Basename
+# alone misses these — e.g. GalaxyUpdater.exe sits under a "redists" DIR, its
+# own filename has no "redist" in it.
+_INSTALL_JUNK_PATH_TOKENS = (
+    "redist", "vcredist", "vc_redist", "dxsetup", "dotnetfx", "dotnet",
+    "dxwebsetup", "overlay", "injected",
+)
+# Name-level: match against the basename only, so a legitimately-named launch
+# exe elsewhere in the tree (e.g. some other app's "Service.exe") isn't caught
+# by a directory match that doesn't apply to it.
+_INSTALL_JUNK_NAME_TOKENS = (
+    "unins", "setup", "crashreporter", "crashhandler", "crashpad", "crashsender",
+    "helper", "service", "updater", "notification", "renderer", "launcherpatcher",
+)
+
+
+def _is_junk_installed_exe(rel_path: str) -> bool:
+    """True for installer/runtime/uninstaller/background-service noise that
+    isn't the launch exe. Takes a path RELATIVE TO drive_c (not just the
+    basename) — path tokens need directory context to match at all."""
+    p = rel_path.lower()
+    n = Path(rel_path).name.lower()
+    return (any(tok in p for tok in _INSTALL_JUNK_PATH_TOKENS)
+            or any(tok in n for tok in _INSTALL_JUNK_NAME_TOKENS))
+
+
+# Wine/Proton's own binaries that live OUTSIDE drive_c/windows, plus installer
+# scratch dirs. These must always be dropped: on a fresh prefix the pre-install
+# snapshot is empty (NAGO only mkdirs an empty dir — umu builds the prefix
+# during the install run), so Wine's stock Program Files exes would otherwise
+# count as "newly installed" and flood the picker.
+_WINE_BUILTIN_EXES = frozenset({
+    "iexplore.exe", "wmplayer.exe", "msiexec.exe", "winemine.exe", "notepad.exe",
+    "wordpad.exe", "explorer.exe", "regedit.exe", "control.exe", "winecfg.exe",
+    "wineboot.exe", "services.exe", "rundll32.exe", "winhlp32.exe", "hh.exe",
+    "presentationfontcache.exe", "wusa.exe", "conhost.exe", "cmd.exe",
+    "winedbg.exe", "oleview.exe", "wineconsole.exe",
+})
+_WINE_BUILTIN_DIRS = frozenset({
+    "internet explorer", "windows media player", "common files", "windows nt",
+    "windows photo viewer", "windows sidebar", "uninstall information",
+    "windows mail", "windows defender", "microsoft.net", "gecko", "mono",
+})
+
+
+def _is_wine_builtin_exe(path: str, dc) -> bool:
+    """True for Wine's stock binaries and installer temp extractions."""
+    try:
+        rel = Path(path).relative_to(dc)
+    except ValueError:
+        return False
+    if rel.name.lower() in _WINE_BUILTIN_EXES:
+        return True
+    parts = [p.lower() for p in rel.parts[:-1]]
+    if any(p in _WINE_BUILTIN_DIRS for p in parts):
+        return True
+    if "temp" in parts:          # users/<u>/Temp, AppData/Local/Temp
+        return True
+    return False
+
+
+def _scan_prefix_exes(pfx) -> set:
+    """All .exe under <prefix>/drive_c EXCEPT the Wine system tree
+    (drive_c/windows) — installers never target it, and including it would flood
+    a fresh-prefix diff with hundreds of Wine binaries. Absolute path strings."""
+    out: set = set()
+    try:
+        dc = Path(pfx) / "drive_c"
+        if not dc.is_dir():
+            return out
+        for p in dc.rglob("*.[eE][xX][eE]"):
+            try:
+                rel = p.relative_to(dc)
+            except ValueError:
+                continue
+            if rel.parts and rel.parts[0].lower() == "windows":
+                continue
+            try:
+                if p.is_file():
+                    out.add(str(p))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def _remap_prefix_path(old: str, tmp_pfx: str, real_pfx: str) -> str:
+    """Rewrite a path living inside tmp_pfx to the same spot under real_pfx.
+
+    Returns "" when there's nothing to do (empty input, or the path isn't inside
+    tmp_pfx). Needed because a Proton install writes the program into the
+    prefix's drive_c, so exe_path points inside the temp prefix — and _add_game
+    renames that prefix on save. Without this the entry keeps a path that no
+    longer exists and can never launch.
+    """
+    old = (old or "").strip()
+    if not old or not tmp_pfx:
+        return ""
+    t = str(tmp_pfx).rstrip("/")
+    if old == t or old.startswith(t + "/"):
+        return str(real_pfx) + old[len(t):]
+    return ""
+
+
+class _InstalledExePicker(_NAGODialog):
+    """Pick the launch exe from the set an installer just added to the prefix."""
+
+    def __init__(self, candidates: list, all_candidates: list, prefix: str, parent=None):
+        super().__init__(parent)
+        self.selected: str = ""
+        self._cands = list(candidates)
+        self._all_cands = list(all_candidates)
+        self._prefix_dc = str(Path(prefix) / "drive_c")
+        self.setWindowTitle("Pick the launch executable")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._min_w = 560 + self._SHADOW * 2
+        self._min_h = 320 + self._SHADOW * 2
+        self.setMinimumSize(self._min_w, self._min_h)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(self._SHADOW, self._SHADOW, self._SHADOW, self._SHADOW)
+        outer.setSpacing(0)
+        root = QFrame()
+        root.setObjectName("dialogRoot")
+        outer.addWidget(root)
+
+        layout = QVBoxLayout(root)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 16)
+
+        title = QLabel("Pick the launch executable")
+        title.setObjectName("dlgTitle")
+        layout.addWidget(title)
+
+        lbl = QLabel("The installer added these programs. Choose the one that "
+                     "launches the app — the rest are usually helpers or "
+                     "uninstallers.")
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self._list = QListWidget()
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.itemDoubleClicked.connect(lambda *_: self._accept())
+        layout.addWidget(self._list)
+
+        # Filtering is heuristic and can hide the real target alongside the
+        # noise (e.g. a launch exe whose name happens to contain "service").
+        # This toggle reveals everything the diff found, unfiltered, so
+        # filtering hard is safe rather than a gamble.
+        self._show_all_cb = NAGOCheckBox("Show all detected executables")
+        self._show_all_cb.setChecked(len(self._cands) != len(self._all_cands) and not self._cands)
+        self._show_all_cb.toggled.connect(self._repopulate)
+        if len(self._all_cands) > len(self._cands):
+            layout.addWidget(self._show_all_cb)
+        self._repopulate()
+
+        dlg_btns = QHBoxLayout()
+        dlg_btns.setSpacing(8)
+        cancel = QPushButton("  Skip")
+        cancel.setIcon(ph_icon("x", 18))
+        cancel.setIconSize(QSize(18, 18))
+        cancel.setObjectName("secondary")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("  Use this exe")
+        ok.setIcon(ph_icon("check", 18))
+        ok.setIconSize(QSize(18, 18))
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._accept)
+        dlg_btns.addStretch()
+        dlg_btns.addWidget(cancel)
+        dlg_btns.addWidget(ok)
+        layout.addLayout(dlg_btns)
+
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(16, 16)
+
+        # Restore the saved dialog size, falling back to a sensible default.
+        # Wrapped so a corrupt/hand-edited config.json can never break the dialog.
+        _saved = load_config().get("installed_exe_picker", {})
+        try:
+            w = int(_saved.get("width", 0))
+            h = int(_saved.get("height", 0))
+        except (ValueError, TypeError):
+            w = h = 0
+        if w >= self._min_w and h >= self._min_h:
+            self.resize(w, h)
+        else:
+            self.resize(self._min_w, 420 + self._SHADOW * 2)
+
+    def _repopulate(self):
+        self._list.clear()
+        src = self._all_cands if self._show_all_cb.isChecked() else self._cands
+        self._active = list(src)
+        for c in self._active:
+            disp = c
+            try:
+                disp = str(Path(c).relative_to(self._prefix_dc))
+            except ValueError:
+                pass
+            self._list.addItem(disp)
+        if self._active:
+            self._list.setCurrentRow(0)
+
+    def _accept(self):
+        r = self._list.currentRow()
+        if 0 <= r < len(self._active):
+            self.selected = self._active[r]
+        self.accept()
+
+    def done(self, r):
+        # Persist the current size on every close path (Use this exe / Skip / Esc).
+        # merge_save_config rather than load->mutate->save_config: it can't
+        # clobber an unrelated setting written between the read and the write.
+        try:
+            merge_save_config({"installed_exe_picker": {
+                "width": self.width(), "height": self.height()
+            }})
+        except Exception as e:
+            _NAGOLog.session(f"[warn] could not save exe-picker dialog size: {e}")
+        super().done(r)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Park the grip at the dialogRoot's inner bottom-right corner, just
+        # inside the shadow margin. Without this it sits at (0, 0), over the
+        # title, with a resize cursor in the wrong corner.
+        if hasattr(self, "_grip"):
+            s = self._SHADOW
+            self._grip.move(
+                self.width()  - s - self._grip.width(),
+                self.height() - s - self._grip.height(),
+            )
+            self._grip.raise_()
+
+
 class GameDialog(_NAGODialog):
-    def __init__(self, config: dict, game: dict = None, parent=None):
+    def __init__(self, config: dict, game: dict = None, parent=None,
+                 as_tool: bool = False):
         super().__init__(parent)
         self.config = config
         self.game   = game or {}
-        self.setWindowTitle("Add Game" if not game else "Edit Game")
+        # Tool mode is Add-only, decided by WHERE the dialog was opened from
+        # (Tools page active → topbar button says "Add Tool" → as_tool=True).
+        # Location-based classification replaced the "Add as Tool" checkbox:
+        # no state to gate, nothing to mis-tick. Edit never uses this — it
+        # preserves the entry's stored is_tool. Tools are Proton-only, so
+        # tool mode locks the runner (pills hidden, cur forced to proton).
+        self._as_tool = bool(as_tool) and not game
+        # Single noun for every user-facing string in this dialog — covers
+        # Add-flow tool mode AND editing an existing tool. Wording sweep:
+        # tools kept reading "game" in titles, placeholders, prompts.
+        self._entity = "tool" if (self._as_tool or bool(self.game.get("is_tool"))) else "game"
+        if self._as_tool:
+            self.setWindowTitle("Add Tool")
+        elif not game:
+            self.setWindowTitle("Add Game")
+        else:
+            self.setWindowTitle("Edit Tool" if self._entity == "tool" else "Edit Game")
         self.setMinimumWidth(620 + self._SHADOW * 2)
         self.setMaximumWidth(620 + self._SHADOW * 2)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
@@ -9913,7 +11765,7 @@ class GameDialog(_NAGODialog):
                 EDIT_PROTON_H = 690
                 h = EDIT_PROTON_H
         else:
-            ADD_GAME_H = 750
+            ADD_GAME_H = 760
             h = ADD_GAME_H
 
         self.setFixedHeight(h)
@@ -9933,6 +11785,8 @@ class GameDialog(_NAGODialog):
 
         # Default to Proton for the Add flow; keep the stored value when editing
         cur = self.game.get("game_type") or ("proton" if not self.game else "native")
+        if self._as_tool:
+            cur = "proton"  # tools are Proton-only; runner pills hidden below
 
         # ── Cover + Info header ────────────────────────────────────────────
         info_header = QWidget()
@@ -9952,8 +11806,8 @@ class GameDialog(_NAGODialog):
         self._dlg_cover_card = GameCard(_dlg_game_ref, accent_color=self.config.get("accent_color", DEFAULT_ACCENT), parent=self)
         self._dlg_cover_card._name_label.hide()
         self._dlg_cover_card._playtime_label.hide()
-        self._dlg_cover_card._rating_chip.hide()
-        self._dlg_cover_card._chip_disabled = True   # never show chip on the dialog cover
+        self._dlg_cover_card._star_row.hide()
+        self._dlg_cover_card._chip_disabled = True   # never show hover rating on the dialog cover
         # Resize to dialog thumbnail dimensions
         self._dlg_cover_card.setFixedSize(COVER_W, HEADER_H)
         # Cover area fills the full card in the dialog (no bottom strip)
@@ -10196,10 +12050,10 @@ class GameDialog(_NAGODialog):
             )
             _si_color = "#18181b" if _current_theme() == "light" else "#ffffff"
             # Dim grey for disabled (undetected) source icons — matches the
-            # #secondary:disabled text token (__T_TEXT6__) so the whole button
-            # reads greyed. store_icon bakes the colour in, so Qt won't dim it
-            # for us; we render the disabled variant explicitly.
-            _si_dis_color = "#a1a1aa" if _current_theme() == "light" else "#505058"
+            # #secondary:disabled text token (__T_TEXT_DISABLED__) so the whole
+            # button reads greyed. store_icon bakes the colour in, so Qt won't
+            # dim it for us; we render the disabled variant explicitly.
+            _si_dis_color = "#c6c6ce" if _current_theme() == "light" else "#3d3d44"
             for _il, _iv, _svg_name, _idetected in _IMPORT_SOURCES:
                 # Every source shows a button; undetected launchers render
                 # disabled (greyed via #secondary:disabled QSS) with a tooltip
@@ -10286,6 +12140,10 @@ class GameDialog(_NAGODialog):
             ip.addWidget(_header_container)
         else:
             ip.addWidget(_seg_frame)
+            if self._as_tool:
+                # Runner locked to Proton in tool mode — the pills stay built
+                # (handlers/state shared with the normal Add flow) but hidden.
+                _seg_frame.setVisible(False)
             ip.addStretch()
 
         # Name input — centered, borderless, bold
@@ -10308,12 +12166,11 @@ class GameDialog(_NAGODialog):
                 if self.document().isEmpty() and self._ph_text:
                     _p = QPainter(self.viewport())
                     _p.setFont(self.font())
-                    _col = self.palette().color(self.foregroundRole())
-                    _col.setAlpha(128)  # matches Qt's own default placeholder
-                    # dimming convention (text color at 50% alpha) — the QSS
-                    # ::placeholder color rule was confirmed inert, so this
-                    # was already the effective color; only alignment changes.
-                    _p.setPen(_col)
+                    # Read the palette's PlaceholderText role so this field
+                    # always matches every native placeholder — the faded
+                    # color is defined once in _apply_palette, both themes.
+                    _p.setPen(self.palette().color(
+                        QPalette.ColorRole.PlaceholderText))
                     _p.drawText(self.viewport().rect(),
                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                                 self._ph_text)
@@ -10321,7 +12178,7 @@ class GameDialog(_NAGODialog):
 
         self.name_input = _CenteredPlaceholderTextEdit(_initial_title)
         self.name_input.setObjectName("dlgNameInput")
-        self.name_input.setPlaceholderText("New Game")
+        self.name_input.setPlaceholderText("New Tool" if self._entity == "tool" else "New Game")
         self.name_input.setAcceptRichText(False)
         # Names that wrap past two visual lines used to be clipped with no way to
         # reach the hidden text (height is fixed at two lines, scrollbars off).
@@ -10395,6 +12252,7 @@ class GameDialog(_NAGODialog):
             val.setObjectName("statValue")
             wv.addWidget(lbl)
             wv.addWidget(val)
+            w._val_lbl = val   # exposed so callers can live-update the value
             return w
 
         # Always read playtime stats fresh from DB so the dialog shows accurate
@@ -10434,7 +12292,17 @@ class GameDialog(_NAGODialog):
         stats_h = QHBoxLayout(stats_row)
         stats_h.setContentsMargins(0, 0, 0, 0)
         stats_h.setSpacing(6)
-        stats_h.addWidget(_stat_widget("Playtime", _pt_text))
+        # Playtime is manually editable via right-click (edit mode only).
+        # The edited value is STAGED here and written to the DB only on
+        # Save Changes; closing the dialog any other way discards it.
+        self._pt_stat_widget = _stat_widget("Playtime", _pt_text)
+        self._pt_minutes_staged = int(_pt_minutes or 0)
+        self._playtime_dirty = False
+        if self.game and self.game.get("id"):
+            self._pt_stat_widget.setToolTip("Right-click to edit playtime")
+            self._pt_stat_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._pt_stat_widget.customContextMenuRequested.connect(self._edit_playtime_popup)
+        stats_h.addWidget(self._pt_stat_widget)
         stats_h.addWidget(_stat_widget("Last session", _ls_text))
         stats_h.addWidget(_stat_widget("Last played", _lp_text))
         ip.addStretch()
@@ -10663,7 +12531,7 @@ class GameDialog(_NAGODialog):
             _r2_exe_row.setSpacing(8)
             self.exe_input = QLineEdit("")
             self.exe_input.setObjectName("dlgInput")
-            self.exe_input.setPlaceholderText("Path to game executable")
+            self.exe_input.setPlaceholderText(f"Path to {self._entity} executable")
             self._exe_browse_btn = QPushButton("Browse")
             self._exe_browse_btn.setObjectName("secondary")
             self._exe_browse_btn.clicked.connect(self._on_exe_browse_btn_clicked)
@@ -10692,6 +12560,16 @@ class GameDialog(_NAGODialog):
             _r2_install_v.addLayout(_r2_install_row)
             _r2_exe_v.addWidget(_r2_install_widget)
             self._install_dir_widget = _r2_install_widget
+            # Wine Prefix dropdown — tools only, replaces the install-folder
+            # row above (nothing reads install_dir for a tool). Visible in
+            # BOTH Browse and Install sub-modes, unlike install_dir which
+            # only shows in Browse — see _sync_exe_browse_btn_state. Gated
+            # on tool mode at the CALL itself (not just visibility) since
+            # populating it runs several DB queries — no reason to pay that
+            # cost on every plain Add Game, by far the more common flow.
+            if self._entity == "tool":
+                _r2_exe_v.addWidget(self._build_prefix_dropdown_widget())
+                self._install_dir_widget.setVisible(False)
             self._row2_stack.addWidget(_r2_exe)   # index 0
 
             # Page 1 — Steam combo + Rescan + hint
@@ -10740,6 +12618,10 @@ class GameDialog(_NAGODialog):
             sv.addWidget(self._row2_stack)
 
             # ── Row 4: installer options (Proton+Install only) ────────────
+            # Built later, in the footer (Add flow, Proton-only). Initialised
+            # here because _on_type_change can fire during construction, before
+            # the footer exists.
+
             self._inst_options_row = QWidget()
             _ior = QHBoxLayout(self._inst_options_row)
             _ior.setContentsMargins(0, 0, 0, 0)
@@ -10758,6 +12640,13 @@ class GameDialog(_NAGODialog):
             )
             _ior.addWidget(self._inst_scale_cb)
             _ior.addWidget(self._inst_jp_locale_cb)
+            # NOTE: "Add as Tool" deliberately does NOT live here. Scale and
+            # Japanese locale are true install options (they only affect an
+            # installer run); "Add as Tool" is entry classification and applies
+            # equally to a portable tool picked in Browse mode. This row is
+            # Install-mode-only, so hosting it here made portable tools
+            # (portable MO2 etc.) impossible to flag. It's built in the footer
+            # row instead, next to the Add Game button.
             _ior.addStretch(1)
             self._inst_options_row.setVisible(False)
             sv.addWidget(self._inst_options_row)
@@ -10805,7 +12694,7 @@ class GameDialog(_NAGODialog):
                 self.game.get("exe_path", "") if cur not in ("steam", "gog") else ""
             )
             self.exe_input.setObjectName("dlgInput")
-            self.exe_input.setPlaceholderText("Path to game executable")
+            self.exe_input.setPlaceholderText(f"Path to {self._entity} executable")
             self._exe_browse_btn = QPushButton("Browse")
             self._exe_browse_btn.setObjectName("secondary")
             self._exe_browse_btn.clicked.connect(self._on_exe_browse_btn_clicked)
@@ -10913,6 +12802,48 @@ class GameDialog(_NAGODialog):
             _EDIT_PAGE = {"native": 0, "proton": 0, "steam": 1, "gog": 2}
             self._src_stack.setCurrentIndex(_EDIT_PAGE.get(cur, 0))
             sv.addWidget(self._src_stack)
+            # Root install folder — BELOW the kind stack so every runner shows
+            # it (previously Edit silently recomputed install_dir on save and
+            # never displayed it; the value scopes ludusavi territories and
+            # upscaler DLL detection). Populated from the DB; empty falls back
+            # to the heuristic on save. Per kind:
+            #   steam — read-only + Browse disabled: shown for reference, the
+            #           path is managed by Steam's library, not by NAGO;
+            #   gog   — editable like native/proton (the page-local
+            #           _gog_install_dir_input turned out to be a never-shown
+            #           stub, so GOG Edit previously had NO folder field);
+            #   tool  — hidden (nothing that runs for a tool consumes it; the
+            #           hidden field round-trips the DB value on save,
+            #           preserving the prefix remap).
+            _inst_row = QHBoxLayout()
+            _inst_row.setContentsMargins(0, 6, 0, 0)
+            _inst_row.setSpacing(8)
+            self._install_dir_input = QLineEdit(self.game.get("install_dir") or "")
+            self._install_dir_input.setObjectName("dlgInput")
+            self._install_dir_input.setPlaceholderText(
+                f"{self._entity.capitalize()} install folder")
+            self._install_dir_browse_btn = QPushButton("Browse")
+            self._install_dir_browse_btn.setObjectName("secondary")
+            self._install_dir_browse_btn.clicked.connect(self._browse_install_dir)
+            _inst_row.addWidget(self._install_dir_input, 1)
+            _inst_row.addWidget(self._install_dir_browse_btn)
+            _inst_wrap = QWidget()
+            _inst_wrap_v = QVBoxLayout(_inst_wrap)
+            _inst_wrap_v.setContentsMargins(0, 0, 0, 0)
+            _inst_wrap_v.addLayout(_inst_row)
+            if cur == "steam":
+                self._install_dir_input.setReadOnly(True)
+                self._install_dir_input.setToolTip(
+                    "Managed by Steam — shown for reference")
+                self._install_dir_browse_btn.setEnabled(False)
+            if self._entity == "tool":
+                _inst_wrap.setVisible(False)
+            sv.addWidget(_inst_wrap)
+            self._install_dir_widget = _inst_wrap
+            # Wine Prefix dropdown — Edit Tool only, added below the (hidden)
+            # install-dir row in the same card, per the Add-flow's equivalent.
+            if self._entity == "tool":
+                sv.addWidget(self._build_prefix_dropdown_widget())
 
         self._exe_store_row = self._src_stack if self.game else self._row1_stack
 
@@ -10950,10 +12881,41 @@ class GameDialog(_NAGODialog):
         if cur == "steam":
             saved_appid = self.game.get("exe_path", "")
             if saved_appid:
+                _matched = False
                 for i in range(self.steam_combo.count()):
                     if self.steam_combo.itemData(i) == saved_appid:
                         self.steam_combo.setCurrentIndex(i)
+                        _matched = True
                         break
+                if not _matched:
+                    # Heal rows already damaged by the suffix-compounding bug
+                    # (the synthetic label leaked into the name via
+                    # _on_type_change's DIRECT _on_steam_game_picked call —
+                    # signals were blocked, the call wasn't a signal).
+                    import re as _re
+                    _clean = _re.sub(r"(\s*\(not installed\))+$", "",
+                                     self.game.get("name") or "").strip()
+                    if _clean and _clean != self.name_input.toPlainText().strip():
+                        self.name_input.setPlainText(_clean)
+                    # The saved appid is no longer in the installed list
+                    # (game uninstalled from Steam). Without this, the combo
+                    # silently stayed at index 0: the Edit label showed a
+                    # DIFFERENT game, and _save read currentData() — item
+                    # 0's appid — silently rewriting this entry onto the
+                    # wrong game. A synthetic selected entry fixes both:
+                    # label shows the truth, currentData round-trips the
+                    # stored appid.
+                    self.steam_combo.blockSignals(True)
+                    self.steam_combo.addItem(
+                        f"{_clean or saved_appid} (not installed)", saved_appid)
+                    self.steam_combo.setCurrentIndex(self.steam_combo.count() - 1)
+                    self.steam_combo.blockSignals(False)
+                    # _on_type_change calls _on_steam_game_picked DIRECTLY
+                    # (not via signal) during init — the handler must know
+                    # this item is a placeholder, not a user pick, or it
+                    # copies the "(not installed)" label into the name field
+                    # (which then compounds on every open+save).
+                    self._steam_synthetic_appid = saved_appid
             # Edit flow — show label instead of combo; hide rescan
             if self.game and self.game.get("id"):
                 name = self.steam_combo.currentText() or saved_appid or "Unknown"
@@ -11024,7 +12986,7 @@ class GameDialog(_NAGODialog):
         self._winecfg_btn = QPushButton()
         self._winecfg_btn.setIcon(ph_icon("paint-brush", 22))
         self._winecfg_btn.setObjectName("secondary")
-        self._winecfg_btn.setToolTip("Winecfg — configure this game's Wine prefix")
+        self._winecfg_btn.setToolTip(f"Winecfg — configure this {self._entity}'s Wine prefix")
         self._winecfg_btn.setFixedSize(36, 36)
         self._winecfg_btn.clicked.connect(self._run_winecfg)
 
@@ -11049,6 +13011,7 @@ class GameDialog(_NAGODialog):
         )
 
         pv.addWidget(self.proton_selector, 1)
+
         proton_row_h.addWidget(self.proton_frame)
         # Proton selection change (including after Rescan) → re-run umu search
         self.proton_selector.combo.currentIndexChanged.connect(
@@ -11335,6 +13298,23 @@ class GameDialog(_NAGODialog):
         adv_layout.addWidget(hooks_frame)
         self._adv_hooks_frame = hooks_frame
 
+        # Card: Game Store Page — direct URL to the game's store/product page
+        # (Steam, GOG, itch.io, Ren'Py page, …). Auto-filled once at game-add
+        # for Steam games from the AppID; always editable here. Shown for ALL
+        # game types — deliberately not part of the is_steam hide group.
+        store_frame = QFrame()
+        store_frame.setObjectName("settingsSection")
+        sf = QVBoxLayout(store_frame)
+        sf.setSpacing(8)
+        sf.addWidget(self._section_label("Game Store Page"))
+        self.store_url_input = QLineEdit(self.game.get("store_url", "") if self.game else "")
+        self.store_url_input.setObjectName("dlgInputMono")
+        self.store_url_input.setPlaceholderText("e.g. https://store.steampowered.com/app/1091500")
+        self.store_url_input.setToolTip("Direct link to the game's store or product page.\nAdds an \"Open Store Page\" entry to the game's right-click menu.")
+        sf.addWidget(self.store_url_input)
+        adv_layout.addWidget(store_frame)
+        self._adv_store_frame = store_frame
+
         # Card: Compatibility — title header + three body rows
         vn_frame = QFrame()
         vn_frame.setObjectName("settingsSection")
@@ -11509,6 +13489,36 @@ class GameDialog(_NAGODialog):
         # constructed/parented so existing references stay valid.
         _umu_outer.hide()
 
+        # Tool UI Scale (DPI) — tools only. Wine LogPixels override applied
+        # ONLY while this tool runs: set before launch, restored on exit
+        # (see the launch bracket in _launch_game). 0 = off, registry untouched.
+        # Exists because winecfg's "Screen resolution" (really DPI) is
+        # prefix-wide — a shared prefix would leak the setting into games.
+        self._tool_dpi_combo = NAGOComboBox()
+        for _lbl, _dpi in (("96 (default)", 0), ("120 (125%)", 120),
+                           ("144 (150%)", 144), ("168 (175%)", 168),
+                           ("192 (200%)", 192)):
+            self._tool_dpi_combo.addItem(_lbl, userData=_dpi)
+        _cur_dpi = int(self.game.get("tool_dpi", 0) or 0) if self.game else 0
+        _dpi_idx = self._tool_dpi_combo.findData(_cur_dpi)
+        self._tool_dpi_combo.setCurrentIndex(_dpi_idx if _dpi_idx != -1 else 0)
+        self._tool_dpi_combo.setToolTip(
+            "Wine DPI (LogPixels) applied only while this tool is running —\n"
+            "set at launch, restored when the tool exits. Games sharing this\n"
+            "prefix are unaffected. Fixes tools whose UI renders too small.")
+        _dpi_row = QWidget()
+        _dpi_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        _dpi_row_h = QHBoxLayout(_dpi_row)
+        _dpi_row_h.setContentsMargins(0, 8, 0, 0)
+        _dpi_row_h.setSpacing(10)
+        _dpi_row_h.addWidget(QLabel("Tool UI Scale"))
+        _dpi_row_h.addWidget(self._tool_dpi_combo)
+        _dpi_row_h.addStretch()
+        _grid.addWidget(_dpi_row, 3, 0)
+        self._tool_dpi_row = _dpi_row
+        if self._entity != "tool":
+            _dpi_row.hide()
+
         vf.addWidget(_compat_grid)
 
         self._compat_layout.addWidget(vn_frame)
@@ -11659,8 +13669,9 @@ class GameDialog(_NAGODialog):
         _upscale_v.addLayout(_upscale_row)
 
         self._compat_layout.addWidget(self._upscale_frame)
-        self._upscale_frame.setVisible(cur != "steam")
-        self._ingame_upscale_frame.setVisible(cur in ("proton", "gog"))
+        _tool = self._entity == "tool"
+        self._upscale_frame.setVisible(cur != "steam" and not _tool)
+        self._ingame_upscale_frame.setVisible(cur in ("proton", "gog") and not _tool)
         self._compat_layout.addStretch()
 
         adv_layout.addStretch()
@@ -11709,10 +13720,18 @@ class GameDialog(_NAGODialog):
         cancel_btn.setObjectName("secondary")
         cancel_btn.clicked.connect(self.reject)
         footer_row.addWidget(cancel_btn)
-        save_btn = QPushButton("  Save Game")
-        save_btn.setIcon(ph_icon("floppy-disk", 22, "#ffffff"))
+        # Button matches the dialog mode (same condition as the window title):
+        # adding a new game vs saving changes to an existing one. "Save Game"
+        # read like a savegame file — actively confusing in a launcher that
+        # also manages ludusavi save backups.
+        if self.game:
+            save_btn = QPushButton("  Save Changes")
+            save_btn.setIcon(ph_icon("floppy-disk", 22, "#ffffff"))
+        else:
+            save_btn = QPushButton("  Add Tool" if self._as_tool else "  Add Game")
+            save_btn.setIcon(ph_icon("plus", 22, "#ffffff"))
         save_btn.setObjectName("primary")
-        save_btn.setFixedWidth(140)
+        save_btn.setMinimumWidth(140)  # was fixed — "Save Changes" needs room to grow
         save_btn.clicked.connect(self._save)
         footer_row.addWidget(save_btn)
         layout.addLayout(footer_row)
@@ -11726,6 +13745,65 @@ class GameDialog(_NAGODialog):
         lbl = QLabel(text)
         lbl.setObjectName("cardTitle")
         return lbl
+
+    # ── Playtime editor (right-click on the Playtime stat) ────────────────────
+    def _edit_playtime_popup(self, _pos):
+        """Compact hours/minutes editor. The result is staged on the dialog
+        (self._pt_minutes_staged + dirty flag) and only persisted by
+        Save Changes; Cancel here or on the main dialog discards it."""
+        dlg = _NAGODialog(self)
+        dlg.setWindowTitle("Edit Playtime")
+        dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setMinimumWidth(240 + dlg._SHADOW * 2)
+        _outer = QVBoxLayout(dlg)
+        _outer.setContentsMargins(dlg._SHADOW, dlg._SHADOW, dlg._SHADOW, dlg._SHADOW)
+        _outer.setSpacing(0)
+        _root = QFrame()
+        _root.setObjectName("dialogRoot")
+        _outer.addWidget(_root)
+        lv = QVBoxLayout(_root)
+        lv.setContentsMargins(24, 24, 24, 24)
+        lv.setSpacing(12)
+        t = QLabel("Edit Playtime"); t.setObjectName("dlgTitle"); lv.addWidget(t)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        h_inp = QLineEdit(str(self._pt_minutes_staged // 60))
+        h_inp.setObjectName("dlgInput")
+        m_inp = QLineEdit(str(self._pt_minutes_staged % 60))
+        m_inp.setObjectName("dlgInput")
+        for _inp, _suffix in ((h_inp, "hours"), (m_inp, "minutes")):
+            _inp.setAlignment(Qt.AlignmentFlag.AlignRight)
+            _inp.setFixedWidth(64)
+            row.addWidget(_inp)
+            _sl = QLabel(_suffix); _sl.setObjectName("sectionLabel")
+            row.addWidget(_sl)
+        row.addStretch()
+        lv.addLayout(row)
+        h_inp.selectAll()
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+        cancel = QPushButton("  Cancel"); cancel.setObjectName("secondary")
+        cancel.setIcon(ph_icon("x", 22))
+        cancel.clicked.connect(dlg.reject)
+        ok = QPushButton("OK"); ok.setObjectName("primary")
+        ok.clicked.connect(dlg.accept)
+        m_inp.returnPressed.connect(dlg.accept)
+        h_inp.returnPressed.connect(dlg.accept)
+        btns.addStretch(); btns.addWidget(cancel); btns.addWidget(ok)
+        lv.addLayout(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        # Sanitize: digits only, empty = 0. Minutes over 59 normalize into
+        # hours (90m entered -> +1h 30m) rather than erroring.
+        _h = int("".join(c for c in h_inp.text() if c.isdigit()) or 0)
+        _m = int("".join(c for c in m_inp.text() if c.isdigit()) or 0)
+        total = min(_h * 60 + _m, 9_999_999)   # sane ceiling
+        if total == self._pt_minutes_staged and not self._playtime_dirty:
+            return   # unchanged — don't mark dirty
+        self._pt_minutes_staged = total
+        self._playtime_dirty = True
+        self._pt_stat_widget._val_lbl.setText(format_playtime(total) or "—")
 
     # ── Display card (HDR + Gamescope) ────────────────────────────────────────
     def _build_display_card(self, parent_layout):
@@ -11744,7 +13822,11 @@ class GameDialog(_NAGODialog):
         v.addStretch()
 
         _is_steam = (self.game.get("game_type") if self.game else None) == "steam"
-        self._display_card_frame.setVisible(not _is_steam)
+        # Game rendering tech — meaningless on a tool's UI, hidden alongside
+        # the two upscaling cards. Fold into the type gate; a separate
+        # setVisible would be overwritten by _on_type_change re-gating.
+        self._display_card_frame.setVisible(not _is_steam
+                                            and self._entity != "tool")
         self._display_card_frame.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
@@ -11789,14 +13871,20 @@ class GameDialog(_NAGODialog):
         # idle labels hide via _bk_show_status) instead of crowding the title row.
         info_row = QHBoxLayout()
         info_row.setSpacing(12)
+        # Count cache for the backup card: root-path str -> version count. Filled
+        # async by _bk_kick_count (via `backups --api`, the authoritative source)
+        # and invalidated after a backup, so the card doesn't spawn a ludusavi
+        # subprocess on every refresh.
+        self._bk_counts: dict = {}
+        self._bk_count_workers: dict = {}
         self._bk_status = QLabel("")
-        self._bk_status.setObjectName("fieldHint")
+        self._bk_status.setObjectName("bkInfo")
         self._bk_status.hide()
         self._bk_manual_lbl = QLabel("")
-        self._bk_manual_lbl.setObjectName("fieldHint")
+        self._bk_manual_lbl.setObjectName("bkInfo")
         self._bk_manual_lbl.hide()
         self._bk_auto_lbl = QLabel("")
-        self._bk_auto_lbl.setObjectName("fieldHint")
+        self._bk_auto_lbl.setObjectName("bkInfo")
         self._bk_auto_lbl.hide()
         info_row.addWidget(self._bk_status)
         info_row.addWidget(self._bk_manual_lbl)
@@ -11873,6 +13961,12 @@ class GameDialog(_NAGODialog):
             QSizePolicy.Policy.Expanding,
         )
         parent_layout.addWidget(frame, 1)
+        # Tools have no save games — ludusavi looks entries up by name in its
+        # GAME manifest, so this card cannot function for a tool. Built-but-
+        # hidden (not skipped): the save path reads these widgets.
+        self._bk_frame = frame
+        if self._entity == "tool":
+            frame.setVisible(False)
 
         self._bk_worker = None
         self._refresh_backup_card()
@@ -11958,9 +14052,16 @@ class GameDialog(_NAGODialog):
         self._bk_status.hide()
 
         if manual_exists:
-            _m = f"Manual: {last_manual}  ·  {manual_summary}" if manual_summary else f"Manual: {last_manual}"
+            # Card stays short: date + backup count only. Per-version file/size
+            # lives in the Restore picker now, so the line doesn't crop as the
+            # backup count grows.
+            _m = f"Last manual backup  ·  {last_manual}"
+            _n = self._bk_counts.get(str(LUDUSAVI_MANUAL_BACKUPS))
+            if _n:
+                _m += f"  ·  {_n} backup{'s' if _n != 1 else ''}"
             self._bk_manual_lbl.setText(_m)
             self._bk_manual_lbl.show()
+            self._bk_kick_count(title, LUDUSAVI_MANUAL_BACKUPS)
         elif last_manual:
             self._bk_manual_lbl.setText("No backup on disk")
             self._bk_manual_lbl.show()
@@ -11968,9 +14069,13 @@ class GameDialog(_NAGODialog):
             self._bk_manual_lbl.hide()
 
         if auto_exists:
-            _a = f"Auto: {last_auto}  ·  {auto_summary}" if auto_summary else f"Auto: {last_auto}"
+            _a = f"Last auto-backup  ·  {last_auto}"
+            _n = self._bk_counts.get(str(LUDUSAVI_AUTO_BACKUPS))
+            if _n:
+                _a += f"  ·  {_n} backup{'s' if _n != 1 else ''}"
             self._bk_auto_lbl.setText(_a)
             self._bk_auto_lbl.show()
+            self._bk_kick_count(title, LUDUSAVI_AUTO_BACKUPS)
         elif last_auto:
             self._bk_auto_lbl.setText("No backup on disk")
             self._bk_auto_lbl.show()
@@ -12004,9 +14109,40 @@ class GameDialog(_NAGODialog):
 
         # Show manual backup status if last backup was manual
         if manual_summary and "manual" in (manual_summary or "").lower():
-            _m = f"Manual (raw copy): {last_manual}  ·  {manual_summary}"
+            _m = f"Last manual backup (raw copy)  ·  {last_manual}"
             self._bk_manual_lbl.setText(_m)
             self._bk_manual_lbl.show()
+
+    def _bk_kick_count(self, title: str, root):
+        """Fetch the version count for one backup root (async, cached).
+
+        Queries `backups --api` once per root and stores the count in
+        self._bk_counts, then re-renders the card. Skips if the count is already
+        known or a query for that root is in flight, so refreshes don't spawn a
+        subprocess each time. Invalidated (key deleted) after a backup."""
+        if not title:
+            return
+        key = str(root)
+        if key in self._bk_counts:
+            return
+        if self._bk_count_workers.get(key) is not None:
+            return
+        w = LudusaviBackupsListWorker(title, key)
+        self._bk_count_workers[key] = w
+
+        def _done(versions, key=key):
+            self._bk_counts[key] = len(versions)
+            self._bk_count_workers[key] = None
+            self._refresh_backup_card()
+
+        def _fail(_m, key=key):
+            # Leave uncached so a later refresh retries; don't render a count.
+            self._bk_count_workers[key] = None
+
+        w.listed.connect(_done)
+        w.failed.connect(_fail)
+        w.finished.connect(w.deleteLater)
+        w.start()
 
     def _bk_show_status(self, msg: str):
         """Show busy/prompt status on the shared info row, hiding the idle
@@ -12205,6 +14341,9 @@ class GameDialog(_NAGODialog):
         )
         if _cache_title:
             _NAGOLog.session(f"[ludusavi][backup] cached title for shortcut: '{_cache_title}'")
+        # A new backup changes the version count — drop the cache so the refresh
+        # below re-queries it.
+        self._bk_counts.clear()
         self._refresh_backup_card()
         self._bk_flash(f"Backed up — {_summary}", ok=True)
 
@@ -12569,16 +14708,18 @@ class GameDialog(_NAGODialog):
                 return
             self._bk_restore_root = str(LUDUSAVI_MANUAL_BACKUPS if chosen == "manual"
                                         else LUDUSAVI_AUTO_BACKUPS)
+            # The source picker (manual/auto) is itself a deliberate confirm, so
+            # the downstream single-version prompt is suppressed for this path.
+            self._rs_source_confirmed = True
         else:
             source = "manual" if manual_exists else "auto"
             self._bk_restore_root = str(LUDUSAVI_MANUAL_BACKUPS if source == "manual"
                                         else LUDUSAVI_AUTO_BACKUPS)
-            if NAGOMessageBox.question(
-                self, "Restore Saves",
-                f"Restore \"{self.game.get('name', '')}\" saves from the "
-                f"{source} backup?\n\nThis overwrites current save files."
-            ) != QMessageBox.StandardButton.Yes:
-                return
+            # No confirm here anymore. Restore is gated by exactly one dialog:
+            # the version picker when there are 2+ versions, or a single-version
+            # confirm downstream when there aren't. The old Yes/No fired BEFORE
+            # the picker, double-prompting every multi-version restore.
+            self._rs_source_confirmed = False
 
         live_exe = self._current_exe_from_ui()
         if live_exe:
@@ -12673,10 +14814,59 @@ class GameDialog(_NAGODialog):
             self._finish_restore_batch()
             return
         title = self._rs_queue.pop(0)
+        self._rs_current_title = title
+        # Query this title's versioned backups in the chosen root FIRST. With 2+
+        # versions we show the picker; with 0/1 we restore latest as before.
+        # The list call may fail (e.g. `backups --path` unsupported) → degrade
+        # to the prior latest-restore behavior, never a broken picker.
+        self._bk_set_busy(True, "Reading versions...")
+        root = getattr(self, "_bk_restore_root", "")
+        self._rs_list_worker = LudusaviBackupsListWorker(title, root)
+        self._rs_list_worker.listed.connect(self._on_restore_versions_listed)
+        self._rs_list_worker.failed.connect(lambda _m: self._rs_proceed(""))
+        self._rs_list_worker.finished.connect(self._rs_list_worker.deleteLater)
+        self._rs_list_worker.start()
+
+    def _on_restore_versions_listed(self, versions: list):
+        title = getattr(self, "_rs_current_title", "")
+        if len(versions) >= 2:
+            root = getattr(self, "_bk_restore_root", "")
+            dlg = RestoreVersionPickerDialog(
+                self, self.game.get("name", ""), title, root, versions
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                # Cancelled this title — skip it and continue the batch.
+                self._restore_next_in_queue()
+                return
+            self._rs_proceed(dlg.chosen_backup_id())
+            return
+        # 0 or 1 version → no picker. This is the ONLY place the overwrite is
+        # confirmed for those cases, unless the source picker already confirmed
+        # it (both-roots path). Restores the latest as before.
+        if not getattr(self, "_rs_source_confirmed", False):
+            if NAGOMessageBox.question(
+                self, "Restore Saves",
+                f"Restore \"{self.game.get('name', '')}\" saves?\n\n"
+                f"This overwrites current save files."
+            ) != QMessageBox.StandardButton.Yes:
+                self._restore_next_in_queue()   # declined — skip this title
+                return
+            # Don't re-ask for later titles in the same batch.
+            self._rs_source_confirmed = True
+        self._rs_proceed("")
+
+    def _rs_proceed(self, backup_id: str):
+        title = getattr(self, "_rs_current_title", "")
+        if not title:
+            self._restore_next_in_queue()
+            return
         n_done = len(self._rs_results) + 1
         self._bk_set_busy(True, f"Restoring ({n_done})...")
-        self._bk_worker = LudusaviRestoreWorker(self.game, title,
-                                                restore_root=getattr(self, "_bk_restore_root", ""))
+        self._bk_worker = LudusaviRestoreWorker(
+            self.game, title,
+            restore_root=getattr(self, "_bk_restore_root", ""),
+            backup_id=backup_id,
+        )
         self._bk_worker.progress.connect(lambda m: self._bk_show_status(m))
         self._bk_worker.done.connect(self._on_restore_one_done)
         self._bk_worker.failed.connect(self._on_restore_failed)
@@ -12695,8 +14885,12 @@ class GameDialog(_NAGODialog):
 
     def _finish_restore_batch(self):
         results = getattr(self, "_rs_results", [])
-        good = [r for r in results if r.get("processedGames", 0) >= 1]
         self._refresh_backup_card()
+        if not results:
+            # No restore actually ran — every resolved title was cancelled at the
+            # picker or the confirm. Cancelling isn't a failure, so no red flash.
+            return
+        good = [r for r in results if r.get("processedGames", 0) >= 1]
         if not good:
             self._bk_flash("Nothing restored — no backup data found", ok=False)
             return
@@ -13087,9 +15281,10 @@ class GameDialog(_NAGODialog):
         self._steam_adv_warning.setVisible(False)  # legacy — no longer used
         self._steam_general_info_card.setVisible(False)  # moved to Advanced tab
         if hasattr(self, "_upscale_frame"):
-            self._upscale_frame.setVisible(not is_steam)
+            self._upscale_frame.setVisible(not is_steam and self._entity != "tool")
         if hasattr(self, "_ingame_upscale_frame"):
-            self._ingame_upscale_frame.setVisible(is_proton or is_gog)
+            self._ingame_upscale_frame.setVisible((is_proton or is_gog)
+                                                  and self._entity != "tool")
         if hasattr(self, "_hdr_cb"):
             # HDR is hidden only for Steam — NAGO doesn't own the Steam launch
             # path, so flipping the host display from here would leak state into
@@ -13101,7 +15296,8 @@ class GameDialog(_NAGODialog):
             self._gamescope_cb.setVisible(not is_steam)
         if hasattr(self, "_display_card_frame"):
             # Card shows whenever any child is visible (gamescope ok for native).
-            self._display_card_frame.setVisible(not is_steam)
+            self._display_card_frame.setVisible(not is_steam
+                                                 and self._entity != "tool")
         # Resize dialog to fit the new layout, then re-center if needed
         self._lock_height()
         QTimer.singleShot(0, self._snap_inside_screen)
@@ -13156,6 +15352,8 @@ class GameDialog(_NAGODialog):
         appid = self.steam_combo.itemData(idx)
         if not appid:
             return
+        if appid == getattr(self, "_steam_synthetic_appid", None):
+            return  # placeholder for an uninstalled game — never a "pick"
         label = self.steam_combo.itemText(idx)
         # Strip the "  —  appid 12345" suffix to get just the title
         title = label.rsplit("  —  appid", 1)[0].strip()
@@ -13291,6 +15489,71 @@ class GameDialog(_NAGODialog):
             and getattr(self, "_proton_install_mode", "browse") == "install"
         )
 
+    def _resolve_installed_exe(self, pfx, pre_set):
+        """After an install completes: diff the prefix's exe set against the
+        pre-install snapshot to find what the installer added, then fill the exe
+        field. 0 new → leave alone (nothing to guess from); 1 → auto-fill;
+        many → let the user pick. Never raises into the finish handler."""
+        try:
+            new = _scan_prefix_exes(pfx) - set(pre_set)
+        except Exception:
+            return
+        # Structural noise (Wine's own binaries, installer temp) is ALWAYS
+        # dropped — never falls back, since on a fresh prefix it's the bulk of
+        # the diff. The junk filter below is heuristic, so it can fall back
+        # and the picker can reveal it via "Show all".
+        _dc = Path(pfx) / "drive_c"
+        new = {p for p in new if not _is_wine_builtin_exe(p, _dc)}
+        if not new:
+            return
+
+        def _rel(p):
+            try:
+                return str(Path(p).relative_to(_dc))
+            except ValueError:
+                return p
+
+        all_sorted = sorted(new, key=self._install_exe_rank)
+        cands = sorted((p for p in new if not _is_junk_installed_exe(_rel(p))),
+                       key=self._install_exe_rank)
+        if not cands:
+            # Junk filter removed everything — fall back to the full set rather
+            # than silently coming up empty.
+            cands = all_sorted
+        if len(cands) == 1:
+            self._adopt_resolved_exe(cands[0])
+            return
+        dlg = _InstalledExePicker(cands, all_sorted, str(pfx), self)
+        if dlg.exec() and dlg.selected:
+            self._adopt_resolved_exe(dlg.selected)
+
+    def _adopt_resolved_exe(self, exe: str):
+        """Promote a detected exe to a first-class Browse selection. Writing it
+        into exe_input alone is not enough, and worse, gets destroyed:
+        - install_dir / store hint only populate on Browse-confirm or
+          editingFinished — a programmatic setText fires neither, so Save
+          would go out missing the root path;
+        - switching to Browse restores _browse_exe_stash, which still holds
+          the PRE-install field content — overwriting the resolved exe.
+        So: update the stash first, switch modes through the real handler
+        (button states, hint visibility, one code path), then run the same
+        post-pick plumbing a hand-browsed exe gets."""
+        self._browse_exe_stash = exe
+        self._on_proton_mode_picked("browse")
+        self._active_exe_input().setText(exe)
+        self._auto_populate_install_dir(exe)
+        self._scan_exe_for_store(exe)
+
+    @staticmethod
+    def _install_exe_rank(path: str):
+        """Sort key for pre-selection: shallower directory first, then shorter
+        basename. Cheap proxy for 'the app's own launcher' — installers put the
+        real entry point near the install root; helpers/services/updaters tend
+        to sit deeper or have longer decorated names (GalaxyClient Helper.exe
+        vs GalaxyClient.exe)."""
+        p = Path(path)
+        return (len(p.parts), len(p.name))
+
     def _sync_exe_browse_btn_state(self):
         """Single source of truth for the doubled exe Browse/Install button's
         visual state (text/icon/tooltip) — Proton-only, Add flow. Called from
@@ -13312,10 +15575,12 @@ class GameDialog(_NAGODialog):
         if hasattr(self, "_inst_options_row"):
             self._inst_options_row.setVisible(_is_install)
         if hasattr(self, "_install_dir_widget"):
-            self._install_dir_widget.setVisible(not _is_install)
+            self._install_dir_widget.setVisible(not _is_install and self._entity != "tool")
+        if hasattr(self, "_prefix_dropdown_widget"):
+            self._prefix_dropdown_widget.setVisible(self._entity == "tool")
         if _is_install:
             self._exe_browse_btn.setToolTip(
-                "Runs a Windows installer (.exe/.msi) inside this game's prefix.\n"
+                f"Runs a Windows installer (.exe/.msi) inside this {self._entity}'s prefix.\n"
                 "Set the game executable via Browse afterward."
             )
 
@@ -13430,39 +15695,306 @@ class GameDialog(_NAGODialog):
         if not exe_path or not Path(exe_path).is_file():
             return
         detected = _find_install_dir(exe_path)
-        if not self.game:
-            inp = getattr(self, "_install_dir_input", None)
-        else:
-            kind = self.type_combo.currentData()
-            inp = getattr(self, "_gog_install_dir_input" if kind == "gog"
-                          else "_install_dir_input", None)
+        # Add and Edit both use the shared field now — the Edit-gog stub
+        # (_gog_install_dir_input) is dead since the shared field moved below
+        # the kind stack and serves every runner.
+        inp = getattr(self, "_install_dir_input", None)
         if inp is not None:
             inp.setText(detected)
+
+    def _active_install_dir_input(self):
+        """The install-folder input — the shared _install_dir_input in both
+        Add and Edit for every runner kind (the Edit-gog stub is dead since
+        the field moved below the kind stack)."""
+        return getattr(self, "_install_dir_input", None)
 
     def _browse_install_dir(self) -> None:
         """Folder picker for the install_dir field (both Native/Proton and
         GOG browse).  Uses QFileDialog.getExistingDirectory.
         Add Game always uses _install_dir_input; Edit Game picks by kind."""
-        if not self.game:
-            inp = getattr(self, "_install_dir_input", None)
-        else:
-            kind = self.type_combo.currentData()
-            inp = getattr(self, "_gog_install_dir_input" if kind == "gog"
-                          else "_install_dir_input", None)
+        inp = getattr(self, "_install_dir_input", None)
         if inp is None:
             return
-        start = inp.text().strip() or self.config.get("last_browse_dir", str(Path.home()))
+        # Start where the field points; a dead/empty field falls back to the
+        # exe's directory (per request), then last_browse_dir.
+        start = inp.text().strip()
+        if not (start and Path(start).is_dir()):
+            _exe = ""
+            try:
+                _exe = self._active_exe_input().text().strip()
+            except Exception:
+                pass
+            if _exe and Path(_exe).is_file():
+                start = str(Path(_exe).parent)
+            else:
+                start = self.config.get("last_browse_dir", str(Path.home()))
         folder = QFileDialog.getExistingDirectory(self, "Select Install Folder", start)
         if folder:
             inp.setText(folder)
 
+    # ── Wine Prefix dropdown (Add/Edit Tool) ────────────────────────────────
+    # Replaces the install-folder field for tools — a tool has no meaningful
+    # "install folder" of its own (nothing reads it; see the Edit-flow's
+    # existing hidden-but-round-tripped install_dir field). Lets a tool use
+    # its own fresh prefix (default) or share an existing Game's, Tool's, or
+    # Steam prefix. Sentinels: "__new__" (default), "__browse__" (opens a
+    # folder picker), or a resolved absolute prefix path for an existing row.
+    def _build_prefix_dropdown_widget(self) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(4)
+        # NAGOComboBox: NAGO's established styled combo (custom chevron/divider
+        # paint + its own floating popup) — a drop-in QComboBox replacement, so
+        # every call below (addItem/insertSeparator/currentData/etc.) is
+        # unchanged. Its popup renders separators itself via
+        # AccessibleDescriptionRole, so ComboSeparatorDelegate — a plain-
+        # QComboBox item delegate — would never even be consulted here.
+        self._prefix_combo = NAGOComboBox()
+        self._prefix_combo_prev_index = 0
+        self._populate_prefix_combo()
+        self._prefix_combo.currentIndexChanged.connect(self._on_prefix_combo_changed)
+        v.addWidget(self._prefix_combo)
+        self._prefix_dropdown_widget = wrap
+        self._update_prefix_hint()
+        return wrap
+
+    def _populate_prefix_combo(self):
+        """Fill the dropdown: New Prefix and Browse for Prefix (the two actions)
+        at the top, then NAGO Prefixes (games), Tool Prefixes, Steam Prefixes —
+        separators between groups, alphabetical within each. Any browsed/custom
+        path lands at the very bottom under its own separator. Pre-selects the
+        row's current prefix_path if editing an existing tool that references
+        one."""
+        combo = self._prefix_combo
+        combo.blockSignals(True)
+        combo.clear()
+        self._prefix_has_custom = False  # no custom (browsed) item added yet
+        combo.addItem("New Prefix", userData="__new__")
+        combo.addItem("Browse for Prefix…", userData="__browse__")
+        # path → source row id, for the Add-flow Proton pre-fill (owner lookup
+        # without re-resolving prefixes). Only NAGO rows (games + owned tools)
+        # are mapped — Steam/browsed entries have no NAGO Proton to inherit.
+        self._prefix_row_by_path: dict[str, int] = {}
+
+        my_id = self.game.get("id") if self.game else None
+        try:
+            con = db_con()
+            cur = con.execute(
+                "SELECT id, name, exe_path, game_type, is_tool, prefix_owned FROM games "
+                "WHERE game_type IN ('proton','gog','steam')"
+            )
+            rows = cur.fetchall()
+            con.close()
+        except Exception as e:
+            _NAGOLog.session(f"[prefix-dropdown] failed to read games: {e}")
+            rows = []
+
+        nago_games, tool_rows, steam_rows = [], [], []
+        for rid, name, exe_path, gtype, is_tool_flag, prefix_owned_flag in rows:
+            if my_id is not None and rid == my_id:
+                continue
+            if gtype == "steam":
+                steam_rows.append((rid, name or "", exe_path or ""))
+            elif is_tool_flag:
+                # Only list tools that own their prefix. A tool that's itself
+                # a reference would resolve to whatever IT points at, so its
+                # label would promise one thing and deliver another — skip it
+                # here; its actual owner (a game, or another owned tool) is
+                # already listed in its own right.
+                if prefix_owned_flag:
+                    tool_rows.append((rid, name or ""))
+            else:
+                nago_games.append((rid, name or ""))
+
+        nago_games.sort(key=lambda t: t[1].casefold())
+        tool_rows.sort(key=lambda t: t[1].casefold())
+        steam_rows.sort(key=lambda t: t[1].casefold())
+
+        def _resolve_row_prefix(rid: int) -> "Path | None":
+            try:
+                con2 = db_con()
+                cur2 = con2.execute("SELECT * FROM games WHERE id=?", (rid,))
+                r = cur2.fetchone()
+                cols = [d[0] for d in cur2.description] if r else []
+                con2.close()
+            except Exception:
+                return None
+            if not r:
+                return None
+            row_dict = dict(zip(cols, r))
+            return resolve_prefix(row_dict, persist=False)
+
+        if nago_games:
+            combo.insertSeparator(combo.count())
+            for rid, name in nago_games:
+                pfx = _resolve_row_prefix(rid)
+                if pfx:
+                    combo.addItem(name, userData=str(pfx))
+                    self._prefix_row_by_path[str(pfx)] = rid
+        if tool_rows:
+            combo.insertSeparator(combo.count())
+            for rid, name in tool_rows:
+                pfx = _resolve_row_prefix(rid)
+                if pfx:
+                    combo.addItem(name, userData=str(pfx))
+                    self._prefix_row_by_path[str(pfx)] = rid
+        if steam_rows:
+            combo.insertSeparator(combo.count())
+            for rid, name, appid in steam_rows:
+                pfx = resolve_steam_prefix(appid)
+                if pfx:
+                    label = f"{name} ({appid})" if appid else name
+                    combo.addItem(label, userData=str(pfx))
+
+        # Pre-select the current prefix if this tool already references one.
+        # NOT validated here — a since-deleted referenced prefix should still
+        # show what it pointed at rather than silently vanishing. If it matches
+        # a listed row it selects that; otherwise it's surfaced as a bottom
+        # "Custom:" item. Both paths go through the same helper the interactive
+        # Browse handler uses, so placement stays consistent.
+        cur_override = (self.game.get("prefix_path") or "").strip() if self.game else ""
+        cur_owned = bool(int(self.game.get("prefix_owned", 1) or 0)) if (
+            self.game and self.game.get("prefix_owned") is not None) else True
+        if cur_override and not cur_owned:
+            idx = self._add_or_select_custom_prefix(cur_override)
+            combo.setCurrentIndex(idx)
+            self._prefix_combo_prev_index = idx
+        else:
+            combo.setCurrentIndex(0)
+            self._prefix_combo_prev_index = 0
+        combo.blockSignals(False)
+
+    def _find_combo_index_by_path(self, path_str: str):
+        """Return the index of an existing combo item whose stored path is the
+        SAME folder as path_str (resolved — so trailing slashes, symlinks and
+        '.' segments don't create phantom duplicates), or None. Skips the
+        __new__/__browse__ action sentinels."""
+        combo = self._prefix_combo
+        try:
+            target = Path(path_str).expanduser().resolve()
+        except Exception:
+            target = None
+        for i in range(combo.count()):
+            d = combo.itemData(i)
+            if not isinstance(d, str) or d in ("__new__", "__browse__"):
+                continue
+            if d == path_str:
+                return i
+            if target is not None:
+                try:
+                    if Path(d).expanduser().resolve() == target:
+                        return i
+                except Exception:
+                    continue
+        return None
+
+    def _add_or_select_custom_prefix(self, path_str: str) -> int:
+        """If path_str already matches a listed item (any group, or a prior
+        custom entry), return that item's index — no duplicate. Otherwise append
+        it as a bottom 'Custom:' item under a single separator and return its new
+        index. Caller sets currentIndex; signals should already be blocked."""
+        existing = self._find_combo_index_by_path(path_str)
+        if existing is not None:
+            return existing
+        combo = self._prefix_combo
+        if not getattr(self, "_prefix_has_custom", False):
+            combo.insertSeparator(combo.count())
+            self._prefix_has_custom = True
+        label = f"Custom: {Path(path_str).name or path_str}"
+        combo.addItem(label, userData=path_str)
+        return combo.count() - 1
+
+    def _on_prefix_combo_changed(self, idx: int):
+        data = self._prefix_combo.itemData(idx)
+        if data == "__browse__":
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Select existing Wine prefix folder",
+                str(get_prefixes_root()))
+            if not chosen:
+                self._prefix_combo.blockSignals(True)
+                self._prefix_combo.setCurrentIndex(self._prefix_combo_prev_index)
+                self._prefix_combo.blockSignals(False)
+                self._update_prefix_hint()
+                return
+            # Soft-validate: catch the common fat-finger (picking the install
+            # folder or a parent dir instead of the pfx). Not a hard block —
+            # user can override for a legit non-standard layout.
+            if not is_wine_prefix(chosen):
+                proceed = NAGOMessageBox.question(
+                    self, "Doesn't look like a Wine prefix",
+                    f"{chosen}\n\nThis folder has no drive_c/ or system.reg, so "
+                    f"it's probably not a Wine prefix. Use it anyway?"
+                ) == QMessageBox.StandardButton.Yes
+                if not proceed:
+                    self._prefix_combo.blockSignals(True)
+                    self._prefix_combo.setCurrentIndex(self._prefix_combo_prev_index)
+                    self._prefix_combo.blockSignals(False)
+                    self._update_prefix_hint()
+                    return
+            # If it's already listed (a game/tool/steam prefix, or a prior
+            # custom pick), switch to that item instead of adding a duplicate.
+            self._prefix_combo.blockSignals(True)
+            new_idx = self._add_or_select_custom_prefix(chosen)
+            self._prefix_combo.setCurrentIndex(new_idx)
+            self._prefix_combo.blockSignals(False)
+            self._prefix_combo_prev_index = new_idx
+            self._update_prefix_hint()
+            return
+        self._prefix_combo_prev_index = idx
+        # Add-Tool convenience: selecting an existing NAGO row's prefix
+        # pre-fills the Proton selector with the owner's Proton — sensible
+        # default, fully editable, no lock, launch path untouched. Add-only
+        # (Edit keeps the row's own saved Proton). Skipped when the owner has
+        # no explicit Proton (empty = config default; pre-filling would
+        # misrepresent it as a pinned GE choice).
+        if (self._entity == "tool" and not self.game
+                and isinstance(data, str)
+                and data in getattr(self, "_prefix_row_by_path", {})):
+            try:
+                _con = db_con()
+                _row = _con.execute("SELECT proton_path FROM games WHERE id=?",
+                                    (self._prefix_row_by_path[data],)).fetchone()
+                _con.close()
+                _owner_proton = (_row[0] or "").strip() if _row else ""
+                if _owner_proton:
+                    self.proton_selector._set_current(_owner_proton)
+            except Exception as _e:
+                _NAGOLog.session(f"[prefix-dropdown] proton pre-fill failed: {_e}")
+        self._update_prefix_hint()
+
+    def _update_prefix_hint(self):
+        """Explain the selection as a tooltip on the combo itself (was an
+        always-visible hint label below it — removed to reclaim dialog space)."""
+        if not hasattr(self, "_prefix_combo"):
+            return
+        data = self._prefix_combo.currentData()
+        if data == "__new__" or data is None:
+            self._prefix_combo.setToolTip(
+                "Creates its own prefix — deletable later from this tool's context menu.")
+        else:
+            self._prefix_combo.setToolTip(
+                "Shares this existing prefix — NAGO won't create or delete it "
+                "for this tool.")
+
     def _browse_gog_exe(self):
-        """GOG Browse button: pick file → run path scan immediately."""
-        start_dir = self.config.get("last_browse_dir", str(Path.home()))
+        """GOG Browse button: pick file → run path scan immediately.
+        Starts at the current gog exe's directory when valid."""
+        _cur = self.gog_exe_input.text().strip()
+        if _cur and Path(_cur).is_file():
+            start_dir = str(Path(_cur).parent)
+        else:
+            _root_inp = getattr(self, "_install_dir_input", None)
+            _root = _root_inp.text().strip() if _root_inp else ""
+            if _root and Path(_root).is_dir():
+                start_dir = _root
+            else:
+                start_dir = self.config.get("last_browse_dir", str(Path.home()))
         path, _ = QFileDialog.getOpenFileName(self, "Select GOG Executable", start_dir)
         if not path:
             return
         self.config["last_browse_dir"] = str(Path(path).parent)
+        merge_save_config({"last_browse_dir": self.config["last_browse_dir"]})
         self.gog_exe_input.setText(path)
         self._on_gog_browse_path_changed(path)
 
@@ -13684,8 +16216,11 @@ class GameDialog(_NAGODialog):
             os.environ.copy(),
             wineprefix=pfx,
             proton_path=proton_arg,
-            game_id="umu-default",
+            game_id="",   # empty → build_umu_env omits GAMEID → umu defaults to umu-default (same convention as game launches)
             store="",
+            # disable_protonfixes MUST stay False here: umu's winetricks
+            # integration is implemented by protonfixes itself — setting
+            # PROTONFIXES_DISABLE=1 on this path kills winetricks outright.
         )
 
         # Apply per-game env vars from the dialog (DXVK_HUD, MANGOHUD, PROTON_LOG, etc.)
@@ -13908,7 +16443,7 @@ class GameDialog(_NAGODialog):
             if _is_labeled:
                 button.setText("  Run Installer")
                 button.setToolTip(
-                    "Run a Windows installer (.exe/.msi) inside this game's prefix. "
+                    f"Run a Windows installer (.exe/.msi) inside this {self._entity}'s prefix. "
                     "Files need to land under your home folder to be visible afterward."
                 )
             else:
@@ -13921,6 +16456,25 @@ class GameDialog(_NAGODialog):
         if hasattr(self, "_install_mode_btns") and button is getattr(self, "_exe_browse_btn", None):
             for b in self._install_mode_btns:
                 b.setEnabled(not running)
+
+    def _flip_install_to_browse(self, exe_path: str):
+        """Switch the Add-flow Proton card from Install to Browse mode and
+        adopt exe_path as the entry's program — the same post-pick plumbing a
+        hand-browsed exe gets. Shared by the installer-vs-game classifier
+        (confident 'game' verdict) and the unknown-exe soft-gate dialog
+        ('Use as Program' choice) so the two paths can't drift."""
+        self._proton_install_mode = "browse"
+        self._browse_exe_stash = ""  # new path takes over; don't restore old stash
+        for _b in self._install_mode_btns:
+            _b.setChecked(_b.text() == "Browse")
+        if self._inst_options_row is not None:
+            self._inst_options_row.setVisible(False)
+        self._sync_exe_browse_btn_state()
+        self._active_exe_input().setText(exe_path)
+        # Without this the install_dir field sat empty until the save-time
+        # fallback filled it (worked, but looked broken in the UI).
+        self._auto_populate_install_dir(exe_path)
+        self._scan_exe_for_store(exe_path)
 
     def _run_exe_in_prefix(self, button=None):
         """
@@ -13974,6 +16528,7 @@ class GameDialog(_NAGODialog):
         if not exe_path:
             return
         self.config["last_browse_dir"] = str(Path(exe_path).parent)
+        merge_save_config({"last_browse_dir": self.config["last_browse_dir"]})
 
         # ── Installer vs game classification ──────────────────────────────────
         # Only applies in the Add flow (no self.game) when the doubled
@@ -13997,16 +16552,35 @@ class GameDialog(_NAGODialog):
             else:
                 _verdict = _classify_exe(exe_path)
             if _verdict == "game":
-                self._proton_install_mode = "browse"
-                self._browse_exe_stash = ""  # new path takes over; don't restore old stash
-                for _b in self._install_mode_btns:
-                    _b.setChecked(_b.text() == "Browse")
-                if self._inst_options_row is not None:
-                    self._inst_options_row.setVisible(False)
-                self._sync_exe_browse_btn_state()
-                self._active_exe_input().setText(exe_path)
-                self._scan_exe_for_store(exe_path)
+                self._flip_install_to_browse(exe_path)
                 return
+            if _verdict == "unknown":
+                # Soft gate: don't blindly run an unrecognised exe as an
+                # installer — a portable tool (MO2, portable launchers) would
+                # just execute pointlessly in the tmp prefix, install nothing,
+                # and confuse the Stage 3a diff. Confirmed installers (Passes
+                # 1-3) and confirmed games never see this dialog.
+                _fname = Path(exe_path).name
+                _dlg = NAGOMessageBox(
+                    "question", "Not an Installer?",
+                    f"NAGO couldn't identify  {_fname}  as an installer.\n\n"
+                    "It may be a portable app (mod manager, launcher, utility) "
+                    "that doesn't need installing.\n\n"
+                    "Run it as an installer into the prefix, or use it directly "
+                    "as this entry's program?",
+                    self,
+                    buttons=("Cancel", "Use as Program", "Run as Installer"),
+                    default_button="Run as Installer",
+                )
+                if not _dlg.exec():
+                    return  # Esc / closed — treat as Cancel
+                _choice = _dlg.result_label()
+                if _choice == "Cancel":
+                    return
+                if _choice == "Use as Program":
+                    self._flip_install_to_browse(exe_path)
+                    return
+                # "Run as Installer" → fall through to the prefix run
 
         # ── Resolve prefix path ───────────────────────────────────────────────
         game_id   = self.game.get("id")
@@ -14028,7 +16602,7 @@ class GameDialog(_NAGODialog):
                 # Use whatever the user has typed in the name field; fall back to NewGame
                 _dlg_name = self.name_input.toPlainText().strip()
                 _slug = slugify(_dlg_name) if _dlg_name else f"NewGame_{ts}"
-                tmp_dir = get_prefixes_root() / f"{_slug}_{ts}"
+                tmp_dir = get_prefixes_root() / f"{_slug}{PREFIX_ID_SEP}tmp{ts}"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 self._tmp_prefix_path = tmp_dir
                 pfx = str(tmp_dir)
@@ -14054,9 +16628,10 @@ class GameDialog(_NAGODialog):
             os.environ.copy(),
             wineprefix=pfx,
             proton_path=proton_arg,
-            game_id="umu-default",
+            game_id="",   # empty → build_umu_env omits GAMEID → umu defaults to umu-default (same convention as game launches)
             store="",
             extra_share_paths=[exe_path],
+            disable_protonfixes=True,  # arbitrary exe, no fixes wanted — see build_umu_env
         )
         raw_env = self.env_vars_input.text().strip()
         if raw_env:
@@ -14109,6 +16684,13 @@ class GameDialog(_NAGODialog):
         cwd = str(Path(exe_path).parent)
         worker = _RunInPrefixWorker(umu_bin, exe_path, env, cwd)
 
+        # Stage 3a: snapshot the prefix's exe set so _on_done can diff it and
+        # resolve the installed launch exe. Gated to Add-flow + Install-mode
+        # (_exe_browse_is_install_mode already requires `not self.game`), so
+        # running some other exe in a prefix never hijacks the exe field.
+        _detect_install_exe = self._exe_browse_is_install_mode()
+        _pre_install_exes = _scan_prefix_exes(pfx) if _detect_install_exe else set()
+
         def _restore_dpi_log():
             if _dpi_set_ok:
                 _restore_prefix_dpi(umu_bin, env)
@@ -14131,6 +16713,10 @@ class GameDialog(_NAGODialog):
                     self._winecfg_btn.setToolTip("Open Winecfg for this prefix")
                     # ...but re-apply the Proton gate: winetricks stays off for Valve Proton.
                     self._sync_winetricks_for_proton()
+                # Stage 3a: the installer just finished — work out what it added
+                # and fill in the launch exe (auto-fill if unambiguous, else ask).
+                if _detect_install_exe:
+                    self._resolve_installed_exe(pfx, _pre_install_exes)
             except RuntimeError:
                 pass  # dialog closed while running
             _prefix_run_log_footer(_banner_name, "finished ok")
@@ -14169,12 +16755,28 @@ class GameDialog(_NAGODialog):
 
     def _browse_exe(self):
         """Proton Browse button: pick exe → switch runner by file type → scan
-        store markers → fire umu search."""
-        start_dir = self.config.get("last_browse_dir", str(Path.home()))
+        store markers → fire umu search. Starts where the current exe field
+        points (its parent dir) so Edit re-browses open at the game, falling
+        back to last_browse_dir only when the field is empty/dead."""
+        # Three-step anchor: the exe file itself -> the root folder field ->
+        # last_browse_dir. Step 2 covers the renamed-exe case (game update
+        # renamed the binary: file dead, folder alive in the root field).
+        start_dir = ""
+        _cur_exe = self._active_exe_input().text().strip()
+        if _cur_exe and Path(_cur_exe).is_file():
+            start_dir = str(Path(_cur_exe).parent)
+        if not start_dir:
+            _root_inp = self._active_install_dir_input()
+            _root = _root_inp.text().strip() if _root_inp else ""
+            if _root and Path(_root).is_dir():
+                start_dir = _root
+        if not start_dir:
+            start_dir = self.config.get("last_browse_dir", str(Path.home()))
         path, _ = QFileDialog.getOpenFileName(self, "Select Executable", start_dir)
         if not path:
             return
         self.config["last_browse_dir"] = str(Path(path).parent)
+        merge_save_config({"last_browse_dir": self.config["last_browse_dir"]})
         self._active_exe_input().setText(path)
 
         # Auto-switch runner based on file type, BEFORE scanning for store
@@ -14189,7 +16791,9 @@ class GameDialog(_NAGODialog):
         # its own fresh hint wiped out immediately by its own switch to Proton.
         suffix = Path(path).suffix.lower()
         switched_to_native = False
-        if suffix != ".exe" and hasattr(self, "_runner_btns"):
+        if self._as_tool:
+            pass  # runner locked to Proton in tool mode — no suffix auto-switch
+        elif suffix != ".exe" and hasattr(self, "_runner_btns"):
             for _b in self._runner_btns:
                 if _b.property("runnerValue") == "native":
                     _b.setChecked(True)
@@ -14270,7 +16874,11 @@ class GameDialog(_NAGODialog):
         # Steam, so running its raw exe via Proton would just bounce through Steam
         # anyway. If the appid isn't in the combo (pirated / manually-dropped copy not
         # in the real library), fall through to normal Proton handling.
-        if not self.game and hasattr(self, "steam_combo"):
+        # Tool mode: never take over the dialog with the Steam importer — a
+        # tool is Proton-only by definition, and the takeover would change
+        # db_game_type to "steam", failing the is_tool proton gate at save
+        # and silently landing the "tool" in the Library as a game.
+        if not self.game and hasattr(self, "steam_combo") and not self._as_tool:
             _steam_appid = steam_appid_from_exe_path(path)
             if _steam_appid:
                 # Refresh the combo from disk before comparing, so a game the
@@ -14345,7 +16953,10 @@ class GameDialog(_NAGODialog):
             # stay exactly as they were. gog_exe_input/_gog_mode are kept
             # in sync silently too, since _save() reads the exe path from
             # there once kind == "gog".
-            if not self.game:
+            # Tool mode keeps the hint but never flips the type — kind must
+            # stay "proton" or the is_tool gate fails at save and the tool
+            # lands in the Library as a GOG game.
+            if not self.game and not self._as_tool:
                 self.type_combo.blockSignals(True)
                 self.type_combo.setCurrentIndex(2)  # gog
                 self.type_combo.blockSignals(False)
@@ -14440,8 +17051,9 @@ class GameDialog(_NAGODialog):
                     con.close()
             if dupe:
                 NAGOMessageBox.warning(
-                    self, "Duplicate Game",
-                    f'A game with the path "{exe_value}" is already in your library.'
+                    self, "Duplicate Tool" if self._entity == "tool" else "Duplicate Game",
+                    f'A {self._entity} with the path "{exe_value}" is already in your '
+                    f'{"Tools list" if self._entity == "tool" else "library"}.'
                 )
                 return
 
@@ -14513,18 +17125,44 @@ class GameDialog(_NAGODialog):
                 self._auto_populate_install_dir(exe_value)
             _install_dir = _inp.text().strip() if _inp else _find_install_dir(exe_value)
         else:
-            # Edit Game — field not shown, fallback only
-            _install_dir = _find_install_dir(exe_value) if exe_value else ""
+            # Edit — read the field (kind-aware: gog has its own input);
+            # empty field falls back to the heuristic, same as Add. This
+            # replaces the old silent recompute that clobbered manual fixes.
+            _inp = self._active_install_dir_input()
+            _txt = _inp.text().strip() if _inp else ""
+            _install_dir = _txt or (_find_install_dir(exe_value) if exe_value else "")
 
         self.result_data = {
             "name":                name,
             "exe_path":            exe_value,
             "game_type":           db_game_type,
+            # is_tool: Edit PRESERVES the entry's stored value (no control in
+            # Edit — conversions go through the card context menu). Add derives
+            # it from tool mode (dialog opened from the Tools page), still
+            # gated on proton at the save boundary as defence in depth.
+            "is_tool":             (int(bool(self.game.get("is_tool", 0))) if self.game
+                                    else (1 if (kind == "proton" and self._as_tool)
+                                          else 0)),
+            # Wine Prefix dropdown choice (Add/Edit Tool only). None when the
+            # dropdown was never built (games) or is on its default "__new__"
+            # — both cases mean "no explicit prefix-sharing choice was made,
+            # leave prefix_path/prefix_owned exactly as today's logic already
+            # handles them". Any other value is an absolute prefix path the
+            # save handler should pin directly with prefix_owned=0.
+            "_prefix_dropdown_choice": (
+                self._prefix_combo.currentData()
+                if (hasattr(self, "_prefix_combo") and self._entity == "tool"
+                    and self._prefix_combo.currentData() not in (None, "__new__"))
+                else None
+            ),
             "proton_path":         proton_path,
             "umu_enabled":         1,  # unconditional for Proton
             "umu_gameid":          umu_vals["gameid"],
             "umu_store":           umu_vals["store"],
             "launch_args":         self.launch_args_input.text().strip(),
+            "tool_dpi":            (self._tool_dpi_combo.currentData() or 0)
+                                   if (hasattr(self, "_tool_dpi_combo")
+                                       and self._entity == "tool") else 0,
             "env_vars":            _raw_env,
             "vn_jp_locale":        _vn_jp_locale,
             "use_wined3d":         _use_wined3d,
@@ -14564,6 +17202,17 @@ class GameDialog(_NAGODialog):
                                    if hasattr(self, "_mh_missing_pref")
                                    else (1 if (hasattr(self, "_mangohud_cb") and self._mangohud_cb.isChecked()) else 0)),
             "rating":              (self._rating_widget.value() if hasattr(self, "_rating_widget") else 0.0),
+            # Store page URL — prepend https:// when the user pasted a bare
+            # domain. Empty stays empty (no store menu entry).
+            "store_url":           (lambda _u: (f"https://{_u}" if _u and "://" not in _u else _u))(
+                                   self.store_url_input.text().strip() if hasattr(self, "store_url_input") else ""),
+            # Manually edited playtime (right-click on the Playtime stat).
+            # Present in the dict ONLY when actually edited this session —
+            # its absence tells the save path not to touch playtime at all,
+            # so a running game's exit accounting can't be clobbered by a
+            # stale dialog value.
+            **({"playtime_minutes": self._pt_minutes_staged}
+               if getattr(self, "_playtime_dirty", False) else {}),
             "hdr_enabled":         0 if db_game_type == "steam" else (
                                    (1 if getattr(self, "_hdr_user_pref", False) else 0)
                                    if (bool(getattr(self, "_upscale_cb", None) and self._upscale_cb.isChecked()))
@@ -14603,6 +17252,11 @@ class GameDialog(_NAGODialog):
                                     p.unlink()
                             except Exception as e:
                                 _NAGOLog.session(f"[warn] GameDialog._save: failed to delete old cover {old_cover}: {e}")
+                        # Clear the DB column too — the file is gone, and the
+                        # context-menu clear (_clear_cover_art) already does
+                        # this; leaving a dead path here was asymmetric.
+                        con.execute("UPDATE games SET cover_path='' WHERE id=?",
+                                    (gid,))
                 else:
                     p = Path(self._pending_cover_path)
                     if p.exists():
@@ -14649,6 +17303,26 @@ class GameDialog(_NAGODialog):
     def reject(self):
         """Clean up any pending cover — DB was never touched so nothing to restore.
         If a temporary prefix was created during Add Game, ask the user whether to keep it."""
+        # An installer/exe running in the prefix blocks Cancel/Esc outright:
+        # closing here would orphan the wine process with no Stop button left
+        # anywhere, and the tmp-prefix prompt below could rmtree a prefix the
+        # installer is actively writing into. Blocking (vs auto-terminate) is
+        # deliberate — terminate_now() is async, and waiting on it inside
+        # reject() would need re-entry handling for zero user benefit over
+        # one click on the existing Stop button.
+        try:
+            _installing = (self._run_in_prefix_worker is not None and
+                           self._run_in_prefix_worker.isRunning())
+        except RuntimeError:
+            _installing = False
+        if _installing:
+            NAGOMessageBox.warning(
+                self, "Installer Still Running",
+                f"An installer is still running in this {self._entity}'s prefix.\n\n"
+                "Stop it first (the Stop button on the exe row), then close "
+                "the dialog."
+            )
+            return
         # Stop any in-flight cover-download worker first so it can't fire into the
         # dialog as it tears down.
         self._teardown_cover_worker()
@@ -14662,7 +17336,7 @@ class GameDialog(_NAGODialog):
             box = NAGOMessageBox(
                 "question",
                 "Wine Prefix Created",
-                f"A Wine prefix was created for this game but the game was not saved:\n\n"
+                f"A Wine prefix was created for this {self._entity} but the {self._entity} was not saved:\n\n"
                 f"<code>{self._tmp_prefix_path}</code>\n\n"
                 f"Delete it now, or keep it to reuse later?",
                 parent=self,
@@ -15326,9 +18000,9 @@ class _IslandPanel(QWidget):
         theme = _current_theme()
         if theme == "light":
             return (
-                QColor("#ebebef"),   # island BG  — matches __T_SIDEBAR_BG__ light
-                QColor("#d4d4d8"),   # border     — matches __T_BORDER__ light
-                QColor("#f5f5f7"),   # page BG    — matches __T_BG__ light (erase color)
+                QColor("#dcdce2"),   # island BG  — matches __T_SIDEBAR_BG__ light
+                QColor("#c8c8d0"),   # border     — matches __T_BORDER__ light
+                QColor("#f0f0f3"),   # page BG    — matches __T_BG__ light (erase color)
             )
         return (
             QColor("#2a2a30"),       # island BG  — original dark
@@ -15354,6 +18028,17 @@ class _IslandPanel(QWidget):
     def _tab_bar_height(self) -> int:
         th = self._tab_bar.sizeHint().height()
         return th if th > 10 else 38
+
+    def sizeHint(self):
+        # Content-based hint: tab bar + island content + 1px border seam.
+        # Required because the panel does manual child geometry (no layout),
+        # so Qt would otherwise report a useless default hint — with stretch 0
+        # in the page layout the panel would collapse.
+        if not hasattr(self, "_island"):
+            return super().sizeHint()
+        ih = self._island.sizeHint().height()
+        w  = max(self._island.sizeHint().width(), self._tab_bar.sizeHint().width())
+        return QSize(w, self._tab_bar_height() + ih + 1)
 
     def _do_layout(self):
         w  = self.width()
@@ -15486,7 +18171,7 @@ class SettingsPage(QWidget):
             btn = QPushButton(f"  {label}")
             btn.setObjectName("settingsTabBtn")
             btn.setCheckable(True)
-            btn.setIcon(ph_icon(icon_name, 15, "#7e7e88"))
+            btn.setIcon(ph_icon(icon_name, 15, _t("#7e7e88", "#71717a")))
             btn.setIconSize(QSize(15, 15))
             btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, i=idx: self._switch_tab(i))
@@ -15496,7 +18181,7 @@ class SettingsPage(QWidget):
         # ── TAB 1: Appearance ─────────────────────────────────────────────────
         appearance_page = QWidget()
         ap = QVBoxLayout(appearance_page)
-        ap.setContentsMargins(24, 14, 24, 20)
+        ap.setContentsMargins(24, 14, 24, 0)
         ap.setSpacing(12)
         ap.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -15532,17 +18217,15 @@ class SettingsPage(QWidget):
             self._accent_btns.append((hex_color, sb))
         swatch_row.addStretch()
         av2.addLayout(swatch_row)
-        top_row.addWidget(accent_frame, 3)
+        top_row.addWidget(accent_frame, 1)
 
-        # Card size
-        card_frame = QFrame()
-        card_frame.setObjectName("settingsSection")
-        card_frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        card_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        cv = QVBoxLayout(card_frame)
-        cv.setContentsMargins(12, 10, 12, 10)
-        cv.setSpacing(10)
-        cv.addWidget(self._section_label("Card Size"))
+        # Card size — lives inside the Accent Color card, below the swatches
+        _acc_sep1 = QFrame()
+        _acc_sep1.setFrameShape(QFrame.Shape.HLine)
+        _acc_sep1.setObjectName("settingsSep")
+        _acc_sep1.setFixedHeight(1)
+        av2.addWidget(_acc_sep1)
+        av2.addWidget(self._section_label("Card Size"))
         self._card_size_slider = QSlider(Qt.Orientation.Horizontal)
         self._card_size_slider.setMinimum(140)
         self._card_size_slider.setMaximum(280)
@@ -15550,7 +18233,7 @@ class SettingsPage(QWidget):
         self._card_size_slider.setPageStep(10)
         self._card_size_slider.setValue(int(self.config.get("card_width", CARD_W)))
         self._card_size_slider.setTickPosition(QSlider.TickPosition.NoTicks)
-        self._card_size_slider.setToolTip("Default: 185px")
+        self._card_size_slider.setToolTip("Default: 180px")
         self._card_size_val = QLabel(f"{self._card_size_slider.value()}px")
         self._card_size_val.setObjectName("cardSizeVal")
         self._card_size_val.setFixedWidth(42)
@@ -15558,11 +18241,11 @@ class SettingsPage(QWidget):
         slider_row.setSpacing(10)
         slider_row.addWidget(self._card_size_slider, 1)
         slider_row.addWidget(self._card_size_val)
-        cv.addLayout(slider_row)
+        av2.addLayout(slider_row)
         def _update_card_size_label(v: int):
             self._card_size_val.setText(f"{v}px")
             accent = self.config.get("accent_color", DEFAULT_ACCENT)
-            if v == 185:
+            if v == 180:
                 self._card_size_val.setStyleSheet(f"color: {accent}; font-size: 12px; font-weight: 700;")
             else:
                 self._card_size_val.setStyleSheet(f"color: {_t('#7e7e88', '#71717a')}; font-size: 12px; font-weight: 400;")
@@ -15570,7 +18253,30 @@ class SettingsPage(QWidget):
             _update_card_size_label(v)
         self._card_size_slider.valueChanged.connect(_on_card_size_changed)
         _update_card_size_label(self._card_size_slider.value())
-        top_row.addWidget(card_frame, 3)
+
+        # Appearance checkboxes — moved here from the footer save row. Created
+        # early (footer code no longer owns them) and laid out in one row.
+        _acc_sep2 = QFrame()
+        _acc_sep2.setFrameShape(QFrame.Shape.HLine)
+        _acc_sep2.setObjectName("settingsSep")
+        _acc_sep2.setFixedHeight(1)
+        av2.addWidget(_acc_sep2)
+        self._show_play_btn_chk = NAGOCheckBox("Show play button")
+        self._show_play_btn_chk.setChecked(bool(self.config.get("show_play_button", True)))
+        self._show_rating_chk = NAGOCheckBox("Show rating")
+        self._show_rating_chk.setChecked(bool(self.config.get("show_rating", True)))
+        self._light_theme_chk = NAGOCheckBox("Light theme")
+        self._light_theme_chk.setChecked(self.config.get("theme", "dark") == "light")
+        chk_row = QHBoxLayout()
+        chk_row.setSpacing(12)
+        chk_row.addWidget(self._show_play_btn_chk)
+        chk_row.addWidget(self._show_rating_chk)
+        chk_row.addWidget(self._light_theme_chk)
+        chk_row.addStretch()
+        av2.addLayout(chk_row)
+
+        # Tools card is added to top_row further down (built after the helpers
+        # it needs) — accent card first, tools card second.
         ap.addLayout(top_row)
 
         # ── Row 2: Default Proton ─────────────────────────────────────────────
@@ -15583,8 +18289,9 @@ class SettingsPage(QWidget):
         pv.setContentsMargins(12, 10, 12, 10)
         # Build the selector first so the count pill can read its install list —
         # single source of truth shared with _refresh_proton_count_pill.
-        self.proton_selector = ProtonComboBox(self.config.get("default_proton", ""), horizontal=True, config=self.config)
+        self.proton_selector = ProtonComboBox(self.config.get("default_proton", ""), horizontal=False, config=self.config)
         self.proton_selector.size_changed.connect(self._refresh_proton_count_pill)
+        self.proton_selector.hint_lbl.hide()  # count pill in the card header replaces it
         proton_title_row = QHBoxLayout()
         proton_title_row.setContentsMargins(0, 0, 0, 0)
         proton_title_row.setSpacing(8)
@@ -15629,8 +18336,16 @@ class SettingsPage(QWidget):
         path_row.addWidget(clear_btn)
         pfv.addLayout(path_row)
 
-        ap.addWidget(proton_frame)
-        ap.addWidget(prefix_frame)
+        # ── Row 2: Wine Prefixes (full width) ────────────────────────────────
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+        row2.addWidget(prefix_frame, 1)
+        ap.addLayout(row2)
+
+        # ── Row 3: System Tray (left) + Default Proton (right) ───────────────
+        row3 = QHBoxLayout()
+        row3.setSpacing(12)
+        ap.addLayout(row3)
         _compat_btn_ss = "padding: 4px 10px;"
 
         def _vsep():
@@ -15650,15 +18365,13 @@ class SettingsPage(QWidget):
             l.setAlignment(Qt.AlignmentFlag.AlignCenter)
             l.setFixedWidth(width)
             l.setFixedHeight(20)
-            l.setContentsMargins(10, 2, 10, 2)
+            # No contentsMargins — horizontal breathing room is QSS padding
+            # (padding: 1px 10px on #settingsPill). contentsMargins is
+            # subtracted from the QLabel text-draw rect and caused clipping;
+            # QSS padding is not. 12-07.
             return l
 
-        # ── Tools row: System Tray card + Tools card side by side ────────────
-        tools_row = QHBoxLayout()
-        tools_row.setSpacing(8)
-        tools_row.setContentsMargins(0, 0, 0, 0)
-
-        # System Tray card
+        # System Tray card — lives beside Wine Prefixes in row3
         tray_frame = QFrame()
         tray_frame.setObjectName("settingsSection")
         tray_frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -15681,7 +18394,8 @@ class SettingsPage(QWidget):
         tr.addWidget(self._tray_on_close)
         tv.addWidget(tray_inner)
 
-        tools_row.addWidget(tray_frame, 0)
+        row3.addWidget(tray_frame, 0)
+        row3.addWidget(proton_frame, 1)
 
         # ── Tools card (umu-launcher + Winetricks grouped) ────────────────────
         tools_frame = QFrame()
@@ -15700,15 +18414,12 @@ class SettingsPage(QWidget):
         umu_row.setSpacing(10)
         umu_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         _lbl = self._section_label("umu-launcher")
-        _lbl.setFixedWidth(110)
+        _lbl.setFixedWidth(100)
         umu_row.addWidget(_lbl)
-        umu_row.addWidget(_vsep(), 0, Qt.AlignmentFlag.AlignVCenter)
-        umu_row.addWidget(_muted_lbl("Version"))
         self._umu_ver_pill = _pill_lbl(width=70)
         self._umu_ver_pill.setMinimumWidth(70)
         self._umu_ver_pill.setMaximumWidth(180)
         self._umu_ver_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        umu_row.addWidget(self._umu_ver_pill)
         # Protonfix DB controls removed from the visible row (NAGO 04:20). The
         # protonfix database is no longer used. Pill kept constructed-but-hidden so
         # _refresh_umu_db_status() and other references stay valid (now no-op'd).
@@ -15720,12 +18431,13 @@ class SettingsPage(QWidget):
         self._umu_db_age_lbl = QLabel()
         self._umu_db_age_lbl.hide()
         umu_row.addStretch()
+        umu_row.addWidget(self._umu_ver_pill)
         self._umu_install_btn = QPushButton()
         self._umu_install_btn.setIcon(ph_icon("upload-simple", 20))
         self._umu_install_btn.setObjectName("compatBtn")
         self._umu_install_btn.setFixedWidth(36)
         self._umu_install_btn.setToolTip("Update umu-launcher")
-        self._umu_install_btn.clicked.connect(self._install_umu)
+        self._umu_install_btn.clicked.connect(self._on_umu_btn)
         umu_row.addWidget(self._umu_install_btn)
         self._umu_db_btn = QPushButton()
         self._umu_db_btn.setIcon(ph_icon("database", 22))
@@ -15755,16 +18467,14 @@ class SettingsPage(QWidget):
         wt_row.setSpacing(10)
         wt_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         _lbl = self._section_label("Winetricks")
-        _lbl.setFixedWidth(110)
+        _lbl.setFixedWidth(100)
         wt_row.addWidget(_lbl)
-        wt_row.addWidget(_vsep(), 0, Qt.AlignmentFlag.AlignVCenter)
-        wt_row.addWidget(_muted_lbl("Version"))
         self._wt_ver_pill = _pill_lbl(width=110)
         self._wt_ver_pill.setMinimumWidth(70)
         self._wt_ver_pill.setMaximumWidth(180)
         self._wt_ver_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        wt_row.addWidget(self._wt_ver_pill)
         wt_row.addStretch()
+        wt_row.addWidget(self._wt_ver_pill)
         self._wt_install_btn = QPushButton()
         self._wt_install_btn.setIcon(ph_icon("upload-simple", 20))
         self._wt_install_btn.setObjectName("compatBtn")
@@ -15791,22 +18501,20 @@ class SettingsPage(QWidget):
         lud_row.setSpacing(10)
         lud_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         _lbl = self._section_label("Ludusavi")
-        _lbl.setFixedWidth(110)
+        _lbl.setFixedWidth(100)
         lud_row.addWidget(_lbl)
-        lud_row.addWidget(_vsep(), 0, Qt.AlignmentFlag.AlignVCenter)
-        lud_row.addWidget(_muted_lbl("Version"))
         self._lud_ver_pill = _pill_lbl(width=110)
         self._lud_ver_pill.setMinimumWidth(70)
         self._lud_ver_pill.setMaximumWidth(180)
         self._lud_ver_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        lud_row.addWidget(self._lud_ver_pill)
         lud_row.addStretch()
+        lud_row.addWidget(self._lud_ver_pill)
         self._lud_install_btn = QPushButton()
         self._lud_install_btn.setIcon(ph_icon("upload-simple", 20))
         self._lud_install_btn.setObjectName("compatBtn")
         self._lud_install_btn.setFixedWidth(36)
         self._lud_install_btn.setToolTip("Install Ludusavi")
-        self._lud_install_btn.clicked.connect(self._install_ludusavi)
+        self._lud_install_btn.clicked.connect(self._on_lud_btn)
         lud_row.addWidget(self._lud_install_btn)
         # Update Database button — refreshes the manifest (game-save database),
         # separate from the binary update above. database-icon to distinguish it.
@@ -15821,18 +18529,12 @@ class SettingsPage(QWidget):
         self._lud_status_lbl.hide()
         tools_layout.addWidget(lud_row_w)
 
-        tools_row.addWidget(tools_frame, 1)
-        ap.addLayout(tools_row)
+        top_row.addWidget(tools_frame, 1)
 
         # Steam Web API hidden — stub keeps _save/_load from crashing
         self.steam_key_input = QLineEdit(self.config.get("steam_api_key", ""))
         self.steam_key_input.hide()
 
-        # checkboxes moved to footer save row
-        self._show_play_btn_chk = NAGOCheckBox("Play button on hover")
-        self._show_play_btn_chk.setChecked(bool(self.config.get("show_play_button", True)))
-        self._light_theme_chk = NAGOCheckBox("Light theme")
-        self._light_theme_chk.setChecked(self.config.get("theme", "dark") == "light")
 
         _add_tab("note-pencil", "General", appearance_page)
 
@@ -15847,6 +18549,25 @@ class SettingsPage(QWidget):
         advp = QVBoxLayout(advanced_page)
         advp.setContentsMargins(24, 14, 24, 20)
         advp.setSpacing(12)
+
+        # ── Behavior + API Keys row ───────────────────────────────────────────
+        # Behavior card (left): home for behavior toggles that don't fit the
+        # General tab. Staged like all Settings controls — Save commits,
+        # anything else discards.
+        behavior_frame = QFrame()
+        behavior_frame.setObjectName("settingsSection")
+        behavior_frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bhv = QVBoxLayout(behavior_frame)
+        bhv.setSpacing(8)
+        bhv.setContentsMargins(12, 10, 12, 10)
+        bhv.addWidget(self._section_label("Behavior"))
+        self._smooth_scroll_chk = NAGOCheckBox("Smooth scrolling")
+        self._smooth_scroll_chk.setChecked(bool(self.config.get("smooth_scroll", True)))
+        self._smooth_scroll_chk.setToolTip(
+            "Glide the library grid on mouse-wheel scrolling.\n"
+            "Touchpads are unaffected (already smooth).")
+        bhv.addWidget(self._smooth_scroll_chk)
+        bhv.addStretch()
 
         # ── API Keys (moved here from General tab) ────────────────────────────
         api_frame = QFrame()
@@ -15874,13 +18595,11 @@ class SettingsPage(QWidget):
         sgdb_row.addWidget(self.key_input)
         sgdb_row.addWidget(sgdb_show)
         akv.addLayout(sgdb_row)
-        advp.addWidget(api_frame)
-
-        _adv_sep = QFrame()
-        _adv_sep.setFrameShape(QFrame.Shape.HLine)
-        _adv_sep.setObjectName("settingsSep")
-        _adv_sep.setFixedHeight(1)
-        advp.addWidget(_adv_sep)
+        _top_row = QHBoxLayout()
+        _top_row.setSpacing(12)
+        _top_row.addWidget(behavior_frame)
+        _top_row.addWidget(api_frame, 1)   # API card takes the remaining width
+        advp.addLayout(_top_row)
 
         # Global env vars
         env_frame = QFrame()
@@ -15911,8 +18630,11 @@ class SettingsPage(QWidget):
         self._env_hdr_val.setObjectName("envHdrVal")
         hdr_key = self._env_hdr_key
         hdr_val = self._env_hdr_val
-        hdr_layout.addWidget(hdr_key, 3)
-        hdr_layout.addWidget(hdr_val, 1)
+        # 13:7 matches _add_env_row's field stretches exactly — the old 3:1
+        # put the "Value" header at 75% width while value fields start at 65%,
+        # drifting further apart the wider the window.
+        hdr_layout.addWidget(hdr_key, 13)
+        hdr_layout.addWidget(hdr_val, 7)
         hdr_layout.addSpacing(28)
         grid_outer.addWidget(hdr_frame)
         self._env_rows_widget = QWidget()
@@ -15952,24 +18674,17 @@ class SettingsPage(QWidget):
         tab_bar_layout.addStretch()
 
         # ── Save footer ───────────────────────────────────────────────────────
-        save_div = QFrame()
-        save_div.setObjectName("settingsTabDivider")
-        save_div.setFixedHeight(1)
-        island_layout.addWidget(save_div)
-
         save_row = QHBoxLayout()
-        save_row.setContentsMargins(24, 12, 24, 12)
+        save_row.setContentsMargins(0, 18, 0, 0)
         save_row.setSpacing(24)
-        save_row.addWidget(self._show_play_btn_chk)
-        save_row.addWidget(self._light_theme_chk)
         save_row.addStretch()
         save_btn = QPushButton("  Save Settings")
         save_btn.setIcon(ph_icon("floppy-disk", 22, "#ffffff"))
         save_btn.setObjectName("primary")
-        save_btn.setFixedWidth(180)
+        save_btn.setFixedWidth(160)
         save_btn.clicked.connect(self._save)
         save_row.addWidget(save_btn)
-        island_layout.addLayout(save_row)
+        outer.addLayout(save_row)
 
         # Wire panel's tab button list for paintEvent erase calculation
         self._panel._tab_btns = self._tab_btns
@@ -15985,10 +18700,11 @@ class SettingsPage(QWidget):
     def _switch_tab(self, idx: int):
         """Activate tab at idx, update button icon colors."""
         accent = self.config.get("accent_color", DEFAULT_ACCENT)
+        _inactive = _t("#7e7e88", "#71717a")   # same muted pair as cardSizeVal
         for i, (btn, icon_name) in enumerate(self._tab_btns):
             active = (i == idx)
             btn.setChecked(active)
-            btn.setIcon(ph_icon(icon_name, 15, accent if active else "#7e7e88"))
+            btn.setIcon(ph_icon(icon_name, 15, accent if active else _inactive))
         self._stack.setCurrentIndex(idx)
         self._panel.set_active_tab(idx)
 
@@ -16006,6 +18722,15 @@ class SettingsPage(QWidget):
         pill.style().unpolish(pill)
         pill.style().polish(pill)
         pill.setFixedHeight(20)
+        # Let the pill re-fit to the new text (Preferred width, capped at its
+        # maximumWidth, growing into the row's stretch). The visual breathing
+        # room comes from the QSS horizontal padding on #settingsPill, which
+        # pads the paint rect WITHOUT being subtracted from the text-draw area
+        # (unlike contentsMargins, which is — that was the clip). No per-string
+        # width forcing here: setMinimumWidth/setFixedWidth per text spiked the
+        # ROW's minimum width, which broke the 50/50 top-row split and shoved
+        # the accent card. 12-07.
+        pill.updateGeometry()
 
     def _refresh_swatch_borders(self):
         """Re-apply the accent swatch selection rings. The ring color depends on
@@ -16079,6 +18804,12 @@ class SettingsPage(QWidget):
         away from Settings without saving."""
         cfg = self.config
 
+        # Cancel any pending accent debounce first — otherwise an 80ms timer
+        # armed by a just-clicked swatch fires AFTER this revert and repaints
+        # the discarded accent app-wide (config says otherwise). BUG, 12-07.
+        if hasattr(self, "_accent_timer"):
+            self._accent_timer.stop()
+
         # API keys
         self.key_input.setText(cfg.get("sgdb_key", ""))
         self.steam_key_input.setText(cfg.get("steam_api_key", ""))
@@ -16125,6 +18856,8 @@ class SettingsPage(QWidget):
         self._tray_on_game_run.setChecked(bool(cfg.get("tray_on_game_run", False)))
         self._tray_on_close.setChecked(bool(cfg.get("tray_on_close", False)))
         self._show_play_btn_chk.setChecked(bool(cfg.get("show_play_button", True)))
+        self._show_rating_chk.setChecked(bool(cfg.get("show_rating", True)))
+        self._smooth_scroll_chk.setChecked(bool(cfg.get("smooth_scroll", True)))
         self._light_theme_chk.setChecked(cfg.get("theme", "dark") == "light")
 
     def _pick_accent(self, color: str):
@@ -16160,10 +18893,10 @@ class SettingsPage(QWidget):
                        "ok" if count else "error")
 
     def _refresh_count_pill_theme(self):
-        """Re-apply count pill colors after a theme change."""
-        count = len(self.proton_selector._installs)
-        self._set_pill(self._count_pill, f"{count} found" if count else "none found",
-                       "ok" if count else "error")
+        """Re-apply count pill colors after a theme change.
+        Identical to _refresh_proton_count_pill — kept as a named alias so the
+        theme-change call site reads intentionally."""
+        self._refresh_proton_count_pill()
 
     def _validate_prefix_path(self, path: str):
         """Return (ok, error_message) for the Wine prefixes location.
@@ -16173,6 +18906,16 @@ class SettingsPage(QWidget):
         if not path:
             return True, ""
         p = Path(path).expanduser()
+        # Reject relative paths. get_prefixes_root() expands ~ and env vars but
+        # leaves a relative path relative, so it resolves against NAGO's CWD —
+        # a terminal launch from ~ and a .desktop launch land on different
+        # prefix roots and games "lose" their prefixes. BUG, 12-07. Note: the
+        # expanduser() above already absolutized a leading ~, so this only
+        # catches genuinely relative input like "games/prefixes".
+        if not p.is_absolute():
+            return False, ("That path is relative.\n\nUse an absolute path (starting "
+                           "with / or ~) so prefixes land in the same place no matter "
+                           "how NAGO is launched.")
         if p.exists():
             if not p.is_dir():
                 return False, "That path points to a file, not a folder.\n\nPick a directory for the Wine prefixes."
@@ -16204,25 +18947,27 @@ class SettingsPage(QWidget):
         # the stylesheet once, no need for a second application right after.
         if hasattr(self, "_accent_timer"):
             self._accent_timer.stop()
-        # Pull in any keys other parts of the app may have written since we loaded
-        # (e.g. umu_version written by the install worker), so we don't clobber them.
-        on_disk = load_config()
-        on_disk.update(self.config)
-        self.config = on_disk
-
-        self.config["sgdb_key"]            = self.key_input.text().strip().strip('"').strip("'")
-        self.config["steam_api_key"]       = self.steam_key_input.text().strip().strip('"').strip("'")
-        self.config["default_proton"]      = self.proton_selector.selected_path()
-        self.config["prefixes_path"]       = prefix_path
-        self.config["global_env"]          = self._collect_global_env()
-        self.config["accent_color"]        = self._accent_color
-        self._accent_color_original        = self._accent_color   # new baseline
-        self.config["card_width"]           = self._card_size_slider.value()
-        self.config["show_play_button"]     = self._show_play_btn_chk.isChecked()
-        self.config["theme"]                = "light" if self._light_theme_chk.isChecked() else "dark"
-        self.config["tray_on_game_run"]     = self._tray_on_game_run.isChecked()
-        self.config["tray_on_close"]        = self._tray_on_close.isChecked()
-        save_config(self.config)
+        # Merge-save ONLY the keys this page owns. Other components (install
+        # workers, file dialogs, window geometry) may have written since this
+        # page snapshotted config; a full-dict save would revert them. See
+        # merge_save_config(). self.config is refreshed from the merged result.
+        self._accent_color_original = self._accent_color   # new baseline
+        owned = {
+            "sgdb_key":         self.key_input.text().strip().strip('"').strip("'"),
+            "steam_api_key":    self.steam_key_input.text().strip().strip('"').strip("'"),
+            "default_proton":   self.proton_selector.selected_path(),
+            "prefixes_path":    prefix_path,
+            "global_env":       self._collect_global_env(),
+            "accent_color":     self._accent_color,
+            "card_width":       self._card_size_slider.value(),
+            "show_play_button": self._show_play_btn_chk.isChecked(),
+            "show_rating":      self._show_rating_chk.isChecked(),
+            "smooth_scroll":    self._smooth_scroll_chk.isChecked(),
+            "theme":            "light" if self._light_theme_chk.isChecked() else "dark",
+            "tray_on_game_run": self._tray_on_game_run.isChecked(),
+            "tray_on_close":    self._tray_on_close.isChecked(),
+        }
+        self.config = merge_save_config(owned)
         self.config_saved.emit(self.config)
 
     def _browse_prefix_path(self):
@@ -16232,50 +18977,85 @@ class SettingsPage(QWidget):
             self.prefix_path_input.setText(path)
 
     def _refresh_umu_status(self):
+        """Repaint the umu row for its install state. Sets the button to its
+        IDLE role (check when installed, install when not). Never fires a
+        network check — that only happens on a button press. 12-07."""
         kind = umu_install_kind()
         version = get_umu_version()
         active_path = find_umu_run()
+        self._umu_stage = "idle"      # two-stage state: idle | update
+        self._umu_latest_tag = ""
 
         if kind == "system":
-            display_version = version or "…"
-            self._set_pill(self._umu_ver_pill, display_version, "ok")
+            self._set_pill(self._umu_ver_pill, version or "…", "ok")
             self._umu_ver_pill.show()
-            self._umu_install_btn.setToolTip("Reinstall umu-launcher")
-            self._umu_install_btn.setIcon(ph_icon("upload-simple", 20))
             if not version:
                 self._start_version_subprocess_worker(active_path)
         elif kind == "managed":
             self._set_pill(self._umu_ver_pill, version or "…", "ok")
             self._umu_ver_pill.show()
-            self._umu_install_btn.setToolTip("Update umu-launcher")
-            self._umu_install_btn.setIcon(ph_icon("upload-simple", 20))
         else:
             self._set_pill(self._umu_ver_pill, "Not installed", "error")
             self._umu_ver_pill.show()
-            self._umu_install_btn.setToolTip("Install umu-launcher")
-            self._umu_install_btn.setIcon(ph_icon("upload-simple", 20))
+        self._set_umu_btn_role("install" if kind == "none" else "check")
         self._umu_install_btn.setEnabled(True)
 
-        # Async upstream-latest check (only when a managed install exists)
-        if kind == "managed":
-            # Cancel any in-flight previous check before starting a new one
-            old = getattr(self, "_umu_check_worker", None)
-            if old is not None:
-                try:
-                    old.got_version.disconnect()
-                except Exception:
-                    pass
-                if old.isRunning():
-                    old.quit()
-                    old.wait(1000)
+    def _set_umu_btn_role(self, role: str):
+        """Set the umu button's icon + tooltip for its current role.
+        role: 'check' (idle, installed), 'install' (not installed OR update
+        found — the actual download press)."""
+        self._umu_btn_role = role
+        if role == "check":
+            self._umu_install_btn.setIcon(ph_icon("arrows-clockwise", 20))
+            self._umu_install_btn.setToolTip("Check for updates")
+        else:
+            self._umu_install_btn.setIcon(ph_icon("upload-simple", 20))
+            self._umu_install_btn.setToolTip(
+                "Install update" if self._umu_stage == "update"
+                else "Install umu-launcher")
 
-            self._umu_check_current = version  # store outside the lambda
-            self._umu_check_worker = UmuLatestVersionWorker()
-            self._umu_check_worker.got_version.connect(self._on_umu_version_check)
-            self._umu_check_worker.finished.connect(self._umu_check_worker.deleteLater)
-            self._umu_check_worker.finished.connect(
-                lambda: setattr(self, "_umu_check_worker", None))
-            self._umu_check_worker.start()
+    def _on_umu_btn(self):
+        """Button dispatcher: check when idle, install when an update is staged
+        (or when nothing is installed yet)."""
+        role = getattr(self, "_umu_btn_role", "install")
+        if role == "check":
+            self._check_umu_latest(get_umu_version())
+        else:
+            self._install_umu()
+
+    def _check_umu_latest(self, version: str):
+        """Start the background GitHub latest-release check for umu.
+        Fired only by the check button (never on Settings open). 12-07."""
+        # Cancel any pending 'up to date'/'failed' revert so it can't clobber
+        # this fresh check's pill/state mid-flight.
+        if hasattr(self, "_umu_revert_timer"):
+            self._umu_revert_timer.stop()
+        # Cancel any in-flight previous check. DON'T wait() — the worker's
+        # run() is a blocking HTTP GET with no event loop, so wait() would
+        # freeze the GUI thread. Disconnect + orphan; finished→deleteLater
+        # owns its lifetime. 12-07.
+        old = getattr(self, "_umu_check_worker", None)
+        if old is not None:
+            try:
+                old.got_version.disconnect()
+            except Exception:
+                pass
+        self._umu_install_btn.setEnabled(False)
+        self._set_pill(self._umu_ver_pill, "checking…", "pending")
+        self._umu_check_current = version
+        self._umu_check_worker = UmuLatestVersionWorker()
+        self._umu_check_worker.got_version.connect(self._on_umu_version_check)
+        self._umu_check_worker.finished.connect(self._umu_check_worker.deleteLater)
+        # Identity-guarded clear: an ORPHANED previous check finishing after
+        # this one started must not null the slot holding the NEW worker —
+        # that un-tracks the live check, so the next press can't cancel it
+        # and two checks race the pill (stale "Up to date" over a staged
+        # update). Same clobber family as _upscaler_worker.
+        _w = self._umu_check_worker
+        _w.finished.connect(
+            lambda w=_w: self._umu_check_worker is w
+            and setattr(self, "_umu_check_worker", None))
+        self._umu_check_worker.start()
 
     def _start_version_subprocess_worker(self, active_path: str):
         """Run umu-run --version in background and update the status label."""
@@ -16306,22 +19086,45 @@ class SettingsPage(QWidget):
             return
 
     def _on_latest_umu_version(self, current: str, latest: str):
+        self._umu_install_btn.setEnabled(True)
         if not latest:
+            # Network/parse failure — brief notice, stay in check role.
+            self._set_pill(self._umu_ver_pill, "Check failed", "error")
+            self._umu_revert_after(lambda: self._set_pill(
+                self._umu_ver_pill, current or "…", "ok"))
             return
-
-        cur_clean = current.lstrip("v").strip()
+        cur_clean = (current or "").lstrip("v").strip()
         lat_clean = latest.lstrip("v").strip()
         try:
             if cur_clean == lat_clean:
-                self._set_pill(self._umu_ver_pill, current, "ok")
+                # Up to date — show briefly, then revert pill to the version.
+                self._set_pill(self._umu_ver_pill, "Up to date", "ok")
+                self._umu_revert_after(lambda: self._set_pill(
+                    self._umu_ver_pill, current or "…", "ok"))
             else:
+                # Update available — stage the install role.
+                self._umu_stage = "update"
+                self._umu_latest_tag = latest
                 self._set_pill(self._umu_ver_pill, f"{current} → {latest}", "warn")
+                self._set_umu_btn_role("install")
         except RuntimeError:
             pass
 
-    def _install_umu(self):
-        action = "Update" if UMU_BIN.exists() else "Install"
+    def _umu_revert_after(self, fn, ms: int = 3000):
+        """Run fn after ms (default 3s), cancelling any previous pending revert.
+        Used for the transient 'Up to date' / 'Check failed' pill states so a
+        rapid second check press doesn't race the revert."""
+        if not hasattr(self, "_umu_revert_timer"):
+            self._umu_revert_timer = QTimer(self)
+            self._umu_revert_timer.setSingleShot(True)
+        try:
+            self._umu_revert_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self._umu_revert_timer.timeout.connect(fn)
+        self._umu_revert_timer.start(ms)
 
+    def _install_umu(self):
         self._umu_install_btn.setEnabled(False)
         self._set_pill(self._umu_ver_pill, "…", "pending")
 
@@ -16419,11 +19222,14 @@ class SettingsPage(QWidget):
 
     def _install_winetricks(self):
         self._wt_install_btn.setEnabled(False)
-        self._wt_status_lbl.setText("<span style='color:#7e7e88;'>Downloading winetricks…</span>")
         self._set_pill(self._wt_ver_pill, "…", "pending")
 
         self._wt_worker = WinetricksInstallWorker()
-        self._wt_worker.progress.connect(self._wt_status_lbl.setText)
+        # Route progress to the visible pill — umu/ludusavi do the same. The
+        # old _wt_status_lbl is hidden, so progress was invisible during install.
+        self._wt_worker.progress.connect(
+            lambda msg: self._wt_ver_pill.setText(msg)
+        )
         self._wt_worker.finished_ok.connect(self._on_winetricks_installed)
         self._wt_worker.failed.connect(self._on_winetricks_install_failed)
         self._wt_worker.finished.connect(self._wt_worker.deleteLater)
@@ -16442,19 +19248,19 @@ class SettingsPage(QWidget):
 
     # ── Ludusavi ──────────────────────────────────────────────────────────────
     def _refresh_ludusavi_status(self):
+        """Repaint the ludusavi row. Sets the button to its IDLE role (check
+        when installed, install when not). Never fires a network check — that
+        happens only on a button press, mirroring umu. 12-07."""
         kind    = ludusavi_install_kind()
         version = get_ludusavi_version()
+        self._lud_stage = "idle"      # idle | update
+        self._lud_latest_tag = ""
 
-        if kind == "managed":
+        if kind in ("managed", "system"):
             self._set_pill(self._lud_ver_pill, version or "…", "ok")
-            self._lud_install_btn.setToolTip("Update Ludusavi")
-        elif kind == "system":
-            self._set_pill(self._lud_ver_pill, version or "…", "ok")
-            self._lud_install_btn.setToolTip("Fetch Ludusavi (system install detected)")
         else:
             self._set_pill(self._lud_ver_pill, "Not installed", "error")
-            self._lud_install_btn.setToolTip("Install Ludusavi")
-        self._lud_install_btn.setIcon(ph_icon("upload-simple", 20))
+        self._set_lud_btn_role("install" if kind == "none" else "check")
         self._lud_install_btn.setEnabled(True)
         # DB update only makes sense once a binary exists to run it.
         _lud_present = (kind in ("managed", "system"))
@@ -16465,8 +19271,83 @@ class SettingsPage(QWidget):
                 else "Install Ludusavi first"
             )
 
+    def _set_lud_btn_role(self, role: str):
+        self._lud_btn_role = role
+        if role == "check":
+            self._lud_install_btn.setIcon(ph_icon("arrows-clockwise", 20))
+            self._lud_install_btn.setToolTip("Check for updates")
+        else:
+            self._lud_install_btn.setIcon(ph_icon("upload-simple", 20))
+            self._lud_install_btn.setToolTip(
+                "Install update" if self._lud_stage == "update"
+                else "Install Ludusavi")
+
+    def _on_lud_btn(self):
+        role = getattr(self, "_lud_btn_role", "install")
+        if role == "check":
+            self._check_ludusavi_latest(get_ludusavi_version())
+        else:
+            self._install_ludusavi()
+
+    def _check_ludusavi_latest(self, version: str):
+        """Background GitHub latest-release check for ludusavi — button only."""
+        if hasattr(self, "_lud_revert_timer"):
+            self._lud_revert_timer.stop()
+        old = getattr(self, "_lud_check_worker", None)
+        if old is not None:
+            try:
+                old.got_version.disconnect()
+            except Exception:
+                pass
+        self._lud_install_btn.setEnabled(False)
+        self._set_pill(self._lud_ver_pill, "checking…", "pending")
+        self._lud_check_current = version
+        self._lud_check_worker = LudusaviLatestVersionWorker()
+        self._lud_check_worker.got_version.connect(
+            lambda latest: self._on_latest_ludusavi_version(
+                getattr(self, "_lud_check_current", ""), latest))
+        self._lud_check_worker.finished.connect(self._lud_check_worker.deleteLater)
+        # Identity-guarded clear — see _check_umu_latest for the race.
+        _w = self._lud_check_worker
+        _w.finished.connect(
+            lambda w=_w: self._lud_check_worker is w
+            and setattr(self, "_lud_check_worker", None))
+        self._lud_check_worker.start()
+
+    def _on_latest_ludusavi_version(self, current: str, latest: str):
+        self._lud_install_btn.setEnabled(True)
+        if not latest:
+            self._set_pill(self._lud_ver_pill, "Check failed", "error")
+            self._lud_revert_after(lambda: self._set_pill(
+                self._lud_ver_pill, current or "…", "ok"))
+            return
+        cur_clean = (current or "").lstrip("v").strip()
+        lat_clean = latest.lstrip("v").strip()
+        try:
+            if cur_clean == lat_clean:
+                self._set_pill(self._lud_ver_pill, "Up to date", "ok")
+                self._lud_revert_after(lambda: self._set_pill(
+                    self._lud_ver_pill, current or "…", "ok"))
+            else:
+                self._lud_stage = "update"
+                self._lud_latest_tag = latest
+                self._set_pill(self._lud_ver_pill, f"{current} → {latest}", "warn")
+                self._set_lud_btn_role("install")
+        except RuntimeError:
+            pass
+
+    def _lud_revert_after(self, fn, ms: int = 3000):
+        if not hasattr(self, "_lud_revert_timer"):
+            self._lud_revert_timer = QTimer(self)
+            self._lud_revert_timer.setSingleShot(True)
+        try:
+            self._lud_revert_timer.timeout.disconnect()
+        except Exception:
+            pass
+        self._lud_revert_timer.timeout.connect(fn)
+        self._lud_revert_timer.start(ms)
+
     def _install_ludusavi(self):
-        # Version check is fired here (button press) only — never on Settings open.
         self._lud_install_btn.setEnabled(False)
         self._set_pill(self._lud_ver_pill, "…", "pending")
 
@@ -16528,10 +19409,17 @@ class SettingsPage(QWidget):
 class LibraryPage(QWidget):
     status_message = pyqtSignal(str)
     game_launched  = pyqtSignal(str)   # emitted after a game process starts, carries log path
+    converted      = pyqtSignal()      # emitted when an entry flips is_tool (Library<->Tools)
 
-    def __init__(self, config: dict, parent=None):
+    def __init__(self, config: dict, parent=None, is_tool: int = 0):
         super().__init__(parent)
         self.config = config
+        # is_tool=0 → Library grid (games); is_tool=1 → Tools grid (Windows
+        # launchers/mod managers, game_type='proton' + is_tool=1). Same class,
+        # same launch/poll/playtime/cover/backup pipeline; only the master query
+        # is scoped by this flag. The Tools instance is never wired to the
+        # category sidebar, so it always sees category_id=None (flat grid).
+        self._is_tool: int = 1 if is_tool else 0
         self._all_games: list[dict] = []   # master list — full DB, never filtered
         self._game_cats: dict[int, set] = {}  # game_id -> set of category_ids
         self._games: list[dict] = []       # current visible ordered subset
@@ -16541,11 +19429,30 @@ class LibraryPage(QWidget):
         self._show_hidden: bool = False        # toggled by the eye button in toolbar
         self._empty_lbl_e = None
         self._empty_lbl_h = None
+        # Thumbnail generation — bumped on every _full_rebuild and echoed back
+        # by ThumbnailWorker.loaded. _on_thumb_loaded drops emissions from a
+        # superseded worker so stale-size covers can't land on rebuilt cards
+        # (e.g. card width changed while covers were still streaming in).
+        self._thumb_gen: int = 0
         # Track which games are currently running.
         # Maps game_id -> (subprocess.Popen, post_exit_cmd_string).
         # A QTimer polls every 2 seconds to clean up entries whose process exited
         # and to fire the post-exit hook command.
         self._running_games: dict[int, tuple] = {}
+        # gid → (umu_bin, env) for running tools that launched with a DPI
+        # override — consumed by the exit poll to restore LogPixels.
+        self._tool_dpi_restore: dict[int, tuple] = {}
+        # Games whose launch prep (phase 1) is in flight — blocks double-launch
+        # between the Play click and the actual Popen in phase 2.
+        self._launching_games: set = set()
+        # Maps game_id -> _LaunchPrepWorker while phase-1 prep runs.
+        self._launch_prep_workers: dict[int, object] = {}
+        # Maps game_id -> HDR-disable command for running games whose launch
+        # enabled HDR. Kept SEPARATE from the post-exit cmd string so the
+        # restore can be skipped while another HDR game is still running
+        # (previously the first HDR game to exit dropped the monitor back to
+        # SDR underneath any other HDR game still up).
+        self._hdr_games: dict[int, str] = {}
         # Maps game_id -> _RunInPrefixWorker for right-click "Run File in Prefix"
         # runs kicked off from the card menu. Separate from _running_games (the
         # actual game launches) — a tool/installer can run in a game's prefix
@@ -16567,7 +19474,11 @@ class LibraryPage(QWidget):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(2000)
         self._poll_timer.timeout.connect(self._poll_running_games)
-        self._poll_timer.start()
+        # NOT started here — the poll only has work while a game is being
+        # tracked. _ensure_poll_running() starts it at launch time;
+        # _poll_running_games stops it when the last tracked game exits.
+        # A permanently-running 2s timer costs nothing measurable but blocks
+        # CPU deep-idle for no reason while the library just sits open.
         self._build()
         # Defer the initial reload so the window can paint its first frame before
         # we hit SQLite, build cards, and start ThumbnailWorker.  Result: window
@@ -16594,18 +19505,74 @@ class LibraryPage(QWidget):
         self.scroll.setObjectName("libraryScroll")
         self.scroll.viewport().setObjectName("libraryViewport")
         self.scroll.setWidget(self.container)
+        # Smooth mouse-wheel scrolling for the grid. Touchpads pass through
+        # untouched; blocked (native instant) during a card drag.
+        self._smooth = NAGOSmoothScroller(
+            self.scroll,
+            blocked=lambda: self.container._drag_src_card is not None,
+            on_glide_changed=self.container._set_gliding)
+        self._smooth.enabled = bool(self.config.get("smooth_scroll", True))
+        self.container._glide_cancel = self._smooth.cancel
         layout.addWidget(self.scroll)
 
     def update_config(self, cfg: dict):
         self.config = cfg
 
+    def _flow_width(self) -> int:
+        """Width the card flow should use. Always reserves the vertical
+        scrollbar gutter — whether or not the scrollbar is currently shown —
+        so the column count can't oscillate when content height sits right at
+        the viewport threshold (scrollbar toggling changed viewport width,
+        which re-triggered reflow, which toggled the scrollbar: flicker loop).
+        The scrollbar itself stays ScrollBarAsNeeded; only the flow math
+        pretends it is always there."""
+        sb_w = self.scroll.verticalScrollBar().sizeHint().width()
+        fw   = self.scroll.frameWidth() * 2
+        return max(0, self.scroll.width() - fw - sb_w)
+
     def _reflow(self):
         """Re-position all visible cards using the container's flow layout."""
         ordered = [self._cards[g["id"]] for g in self._games if g["id"] in self._cards]
-        self.container.reflow(ordered, self.scroll.viewport().width())
+        self.container.reflow(ordered, self._flow_width())
+        self._recenter_empty_labels()
+
+    def _recenter_empty_labels(self):
+        """Width/centering for the absolutely-positioned empty-state labels.
+        Two traps fixed here, both burned once already:
+        (1) isHidden(), NOT isVisible() — the labels are typically created
+            during startup reload while this page is hidden, where
+            isVisible() is False for every child regardless of setVisible;
+            isHidden() reflects only the explicit flag we set.
+        (2) The viewport width is stale until the page has been current for
+            a full layout pass; the scroll area's own width is correct even
+            on a hidden page (the stack pre-sizes it) — same source the
+            card flow uses, which is why cards never had this bug."""
+        if self._empty_lbl_e is None or self._empty_lbl_e.isHidden():
+            return
+        vw = self.scroll.viewport().width()
+        if vw <= 1:
+            vw = self._flow_width()
+        if vw > 0:
+            self._empty_lbl_e.setFixedWidth(vw)
+            self._empty_lbl_h.setFixedWidth(vw)
+        # THE actual first-visit bug (found via on-hardware [empty-dbg] logs,
+        # after two wrong width/visibility theories): a zero-card
+        # container.reflow() shrinks the container to its ~48px empty
+        # minimum, clipping labels positioned at y=80/120 out of existence.
+        # Which callback lands last (filter's setFixedHeight(200) vs a late
+        # reflow) was a coin flip — first visits lost it, later ones won.
+        # Re-asserting the empty-state height here makes the helper the last
+        # word regardless of ordering, since every path ends by calling it.
+        if self.container.height() < 200:
+            self.container.setFixedHeight(200)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Same-frame reflow: cards track the window edge instead of landing a
+        # frame late (visible swim/stutter during interactive resize).
+        self._reflow()
+        # Settle pass after the scroll area finalizes its own layout this tick;
+        # if geometry didn't change, the moves are no-ops.
         QTimer.singleShot(0, self._reflow)
 
     def reload(self, filter_text: str = None, category_id: int = None):
@@ -16648,7 +19615,8 @@ class LibraryPage(QWidget):
         # Load all games (no filter — master list)
         con = db_con()
         try:
-            cur = con.execute("SELECT * FROM games ORDER BY sort_pos, name COLLATE NOCASE")
+            cur = con.execute("SELECT * FROM games WHERE is_tool=? ORDER BY sort_pos, name COLLATE NOCASE",
+                              (self._is_tool,))
             cols_desc = [d[0] for d in cur.description]
             self._all_games = [dict(zip(cols_desc, row)) for row in cur.fetchall()]
 
@@ -16681,14 +19649,21 @@ class LibraryPage(QWidget):
             if game["id"] in self._running_games:
                 card.set_running(True)
 
-        # Kick off cover loading for all games
+        # Kick off cover loading for all games — the worker composes finished
+        # covers off-thread (scale + corners + scrim). Sizes/DPR are captured
+        # here, AFTER _apply_card_width has updated the globals, so a rebuild
+        # triggered by a card-width change always composes at the new size.
+        self._thumb_gen += 1
         tasks = [
             (g["id"], g["cover_path"])
             for g in self._all_games
             if g.get("cover_path") and Path(g["cover_path"]).exists()
         ]
         if tasks:
-            self._tw = ThumbnailWorker(tasks)
+            screen = self.screen() or QApplication.primaryScreen()
+            dpr    = screen.devicePixelRatio() if screen else 1.0
+            self._tw = ThumbnailWorker(tasks, CARD_W, COVER_H,
+                                       COVER_RADIUS, dpr, self._thumb_gen)
             self._tw.loaded.connect(self._on_thumb_loaded)
             self._tw.finished.connect(self._tw.deleteLater)
             self._tw.start()
@@ -16733,10 +19708,17 @@ class LibraryPage(QWidget):
                 card.setVisible(False)
 
             if not visible:
-                # Empty state labels — positioned absolutely in the container
+                # Empty state labels — positioned absolutely in the container.
+                # Worded per grid: this class serves both the Library (games)
+                # and the Tools page, and "No games yet" on an empty Tools
+                # grid reads wrong.
+                _noun = "tools" if self._is_tool else "games"
                 if self._show_hidden:
-                    empty_msg = "No hidden games"
-                    hint_msg  = "Hide games via right-click → Hide"
+                    empty_msg = f"No hidden {_noun}"
+                    hint_msg  = f"Hide {_noun} via right-click → Hide"
+                elif self._is_tool:
+                    empty_msg = "No tools yet"
+                    hint_msg  = "Add a tool with the + button above"
                 elif category_id is None:
                     empty_msg = "No games yet"
                     hint_msg  = "Add a game with the + button above"
@@ -16754,10 +19736,13 @@ class LibraryPage(QWidget):
                 self._empty_lbl_h.setText(hint_msg)
                 self._empty_lbl_e.setVisible(True)
                 self._empty_lbl_h.setVisible(True)
-                # Centre in the scroll viewport
-                vw = self.scroll.viewport().width()
-                self._empty_lbl_e.setFixedWidth(vw)
-                self._empty_lbl_h.setFixedWidth(vw)
+                # Centre in the scroll viewport — immediately (best available
+                # width) and again next turn: switching to this page and
+                # running this filter happen in one event-loop turn, and no
+                # resizeEvent is guaranteed to follow (the stack pre-sizes
+                # hidden pages, so geometry may not change on switch).
+                self._recenter_empty_labels()
+                QTimer.singleShot(0, self._recenter_empty_labels)
                 self._empty_lbl_e.move(0, 80)
                 self._empty_lbl_h.move(0, 120)
                 self.container.setFixedHeight(200)
@@ -16772,7 +19757,7 @@ class LibraryPage(QWidget):
                     if card and card.parent() is not self.container:
                         card.setParent(self.container)
                 ordered = [self._cards[g["id"]] for g in visible if g["id"] in self._cards]
-                self.container.reflow(ordered, self.scroll.viewport().width())
+                self.container.reflow(ordered, self._flow_width())
         finally:
             self.container.setUpdatesEnabled(True)
 
@@ -16827,81 +19812,57 @@ class LibraryPage(QWidget):
             self._game_cats[game["id"]] = set(new_ids)
             self.status_message.emit(f"Categories updated for {game['name']}")
 
-    def _on_thumb_loaded(self, gid: int, px: QPixmap):
+    def _on_thumb_loaded(self, gid: int, img: QImage, gen: int):
+        # Drop emissions from a superseded worker — its covers were composed
+        # at a stale card size and would render wrong on the rebuilt cards.
+        if gen != self._thumb_gen:
+            return
         if gid in self._cards:
             card = self._cards[gid]
-            card.set_cover(px)
+            card.apply_composed_cover(img)
 
     def _launch_game(self, game: dict):
-        log_file = None  # initialised here so the except handler can close it on crash
-        # Prevent launching a game that's already running — same game_id check covers
-        # both native/proton (in _running_games) and Steam (in _steam_watched).
+        # Phase 1 of 2 — guard, then run all blocking pre-launch work
+        # (HDR probes/enable, pre-launch cmd, gamescope probes) in a
+        # _LaunchPrepWorker thread. Phase 2 (_launch_game_phase2) continues
+        # on the main thread once prep is done. Split so a hung pre-launch
+        # command or stalled display probe can no longer freeze the UI —
+        # previously up to ~57s of accumulated subprocess timeouts ran
+        # inline on the Qt main thread.
         gid = game.get("id")
-        if gid in self._running_games or any(e[0] == gid for e in self._steam_watched.values()):
+        if (gid in self._running_games
+                or gid in self._launching_games
+                or any(e[0] == gid for e in self._steam_watched.values())):
             return
+        self._launching_games.add(gid)
+        worker = _LaunchPrepWorker(game, parent=self)
+        worker.ready.connect(self._launch_game_phase2)
+        worker.finished.connect(worker.deleteLater)
+        self._launch_prep_workers[gid] = worker
+        worker.start()
+
+    def _launch_game_phase2(self, prep: dict):
+        # Phase 2 of 2 — everything Qt-touching and state-mutating, on the
+        # main thread: env/cmd build, Popen, card state, dialogs, DB writes.
+        game = prep["game"]
+        gid  = game.get("id")
+        self._launch_prep_workers.pop(gid, None)
+        # Surface any fail-soft prep warnings (pre-cmd timeout/failure).
+        for _w in prep.get("warnings", []):
+            self.status_message.emit(_w)
+        log_file = None  # initialised here so the except handler can close it on crash
         try:
-            # Pre-launch hook (runs before any other launch logic). Failures are
-            # logged but never block the launch — fail-soft by design.
-            pre_cmd = (game.get("pre_launch_cmd") or "").strip()
-
-            # Precompute HDR launch state ONCE — this same data is needed in
-            # three places (pre-cmd build, post-cmd build, launch log). Without
-            # caching, each call hits _hdr_capable_connectors which spawns a
-            # subprocess (up to 3s timeout each). Computed only when HDR will
-            # actually fire — otherwise an empty list and the rest is no-op.
-            _hdr_will_fire = (bool(game.get("hdr_enabled"))
-                              and bool(game.get("hdr_monitor"))
-                              and not bool(game.get("upscale_enabled"))
-                              and game.get("game_type") != "steam")
-            _hdr_capable_list: list[str] = []
-            _hdr_tool_used = ""
-            if _hdr_will_fire:
-                _use_ksd, _use_gdct = _hdr_tool_choice()
-                _hdr_tool_used = ("kscreen-doctor" if _use_ksd
-                                  else "gdctl" if _use_gdct else "")
-                if _hdr_tool_used:
-                    _hdr_capable_list = _hdr_capable_connectors()
-
-            # HDR enable — runs as its own subprocess BEFORE the user pre_cmd so
-            # neither command can block the other. Steam-type games are excluded
-            # entirely: NAGO doesn't own the Steam launch lifetime, so flipping
-            # HDR on the host display from here would leak state into Steam's
-            # own launcher.
-            _hdr_post_cmd = ""
-            if _hdr_will_fire and _hdr_capable_list:
-                _hdr_pre, _hdr_post_cmd = _hdr_commands(game["hdr_monitor"], connectors=_hdr_capable_list)
-                if _hdr_pre:
-                    try:
-                        subprocess.run(_hdr_pre, shell=True, timeout=15,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except subprocess.TimeoutExpired:
-                        _NAGOLog.launch("[warn] HDR enable timed out (15s)")
-                    except Exception as e:
-                        _NAGOLog.launch(f"[warn] HDR enable failed: {e}")
-
-            if pre_cmd:
-                try:
-                    subprocess.run(pre_cmd, shell=True, timeout=30,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except subprocess.TimeoutExpired:
-                    self.status_message.emit("Pre-launch command timed out (30s)")
-                    _NAGOLog.launch(f"[warn] Pre-launch command timed out (30s): {pre_cmd}")
-                except Exception as e:
-                    self.status_message.emit(f"Pre-launch command failed: {e}")
-                    _NAGOLog.launch(f"[error] Pre-launch command failed: {e}  cmd={pre_cmd}")
+            # Prep results computed by _LaunchPrepWorker (phase 1).
+            _hdr_will_fire    = prep["hdr_will_fire"]
+            _hdr_tool_used    = prep["hdr_tool_used"]
+            _hdr_capable_list = prep["hdr_capable"]
+            _hdr_post_cmd     = prep["hdr_post_cmd"]
+            _gamescope_active = prep["gamescope_active"]
 
             # Per-game extras applied to all launch types
             launch_args = self._parse_launch_args(game.get("launch_args", ""))
             extra_env   = self._parse_env_vars(game.get("env_vars", ""))
 
-            # Resolve gamescope binary once here — used both for env var gating
-            # (HDR path selection) and for cmd building below. Avoids the case
-            # where env vars assume gamescope is active but the binary isn't found.
-            _gamescope_active = (
-                bool(game.get("gamescope_enabled", 0))
-                and game["game_type"] != "steam"
-                and bool(shutil.which("gamescope"))
-            )
             # Japanese locale — stored separately, injected at launch only.
             # Proton recommends HOST_LC_ALL over a raw LC_ALL (Proton sets its own
             # LC_ALL internally and only honours HOST_LC_ALL for host-side overrides),
@@ -16933,7 +19894,10 @@ class LibraryPage(QWidget):
                     # PROTON_ENABLE_WAYLAND/HDR are not needed and would conflict.
                     # DXVK_HDR is only meaningful for DXVK (Proton/GOG); native
                     # games don't use DXVK, so don't pollute their env either.
-                    if _is_proton_runtime:
+                    # Also gated on gamescope actually supporting --hdr-enabled
+                    # (v3.13+): otherwise the game would output HDR10 into an
+                    # SDR gamescope surface → washed-out colours.
+                    if _is_proton_runtime and prep["gamescope_hdr_ok"]:
                         extra_env["DXVK_HDR"] = "1"
                 elif _is_proton_runtime:
                     # PROTON_ENABLE_HDR/WAYLAND are Proton-only. For native HDR
@@ -17050,51 +20014,31 @@ class LibraryPage(QWidget):
             else:
                 # umu is unconditional for all Proton games
 
-                # Use archived prefix override if set and exists, else scan for
-                # an existing prefix folder matching *_<id>, else derive a new one.
-                # Persisted on first use so game renames never break the path.
-                _pfx_override = (game.get("prefix_path") or "").strip()
-                if _pfx_override and Path(_pfx_override).exists():
-                    pfx = _pfx_override
-                else:
-                    # Scan prefixes root for any folder ending in _<game_id>
-                    # — catches pre-fix prefixes created before prefix_path was persisted
-                    _gid_str = str(game["id"])
-                    _found_pfx = None
-                    try:
-                        for _entry in get_prefixes_root().iterdir():
-                            if _entry.is_dir() and _entry.name.endswith(f"_{_gid_str}"):
-                                _found_pfx = str(_entry)
-                                break
-                    except Exception:
-                        pass
-
-                    if _found_pfx:
-                        pfx = _found_pfx
-                    else:
-                        pfx = str(get_game_prefix(game["id"], game.get("name", "")))
-
-                    # Persist so future launches and renames always use this path
-                    _pcon = None
-                    try:
-                        _pcon = db_con()
-                        _pcon.execute("UPDATE games SET prefix_path=? WHERE id=?",
-                                      (pfx, game["id"]))
-                        _pcon.commit()
-                        game["prefix_path"] = pfx
-                    except Exception as _pe:
-                        _NAGOLog.session(f"[warn] failed to persist prefix_path for game {game.get('id')}: {_pe}")
-                    finally:
-                        if _pcon is not None:
-                            try:
-                                _pcon.close()
-                            except Exception:
-                                pass
+                # Resolve this game's prefix, id-anchored and pinned.
+                # resolve_prefix honors a stored path as-is (custom override
+                # or canonical pin, created by umu on first launch if
+                # missing), else self-heals an un-pinned legacy row by
+                # id-exact folder match, else derives and pins the canonical
+                # path — no slug-prefix scan, so a sibling's prefix can
+                # never be selected.
+                pfx = str(resolve_prefix(game, persist=True))
 
                 proton = game.get("proton_path") or self.config.get("default_proton", "")
 
                 umu_bin = find_umu_run()
                 if not umu_bin:
+                    # HDR was already enabled in phase-1 prep — restore SDR
+                    # before bailing, or the monitor stays in HDR with no
+                    # running game to trigger the restore. Skipped if another
+                    # HDR game is running (it owns the restore at its exit).
+                    if _hdr_post_cmd and not self._hdr_games:
+                        try:
+                            subprocess.Popen(_hdr_post_cmd, shell=True,
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+                            _NAGOLog.launch("HDR restore    launch aborted (umu missing) — back to SDR")
+                        except Exception:
+                            pass
                     NAGOMessageBox.warning(
                         None, "umu-launcher Not Found",
                         "umu-launcher is required to launch Proton games but 'umu-run' isn't installed.\n\n"
@@ -17136,8 +20080,30 @@ class LibraryPage(QWidget):
                 env = build_umu_env(os.environ.copy(),
                                     wineprefix=pfx, proton_path=proton_arg,
                                     game_id=game_id, store=store,
-                                    extra_share_paths=[game.get("exe_path", "")])
+                                    extra_share_paths=[game.get("exe_path", "")],
+                                    disable_protonfixes=True)
                 cmd = [umu_bin, game["exe_path"], *launch_args]
+
+                # Tool UI Scale: apply the LogPixels override INSIDE the child
+                # command (shell-chained before the exe) instead of calling
+                # _set_prefix_dpi() here — that's a synchronous umu call taking
+                # seconds, which would freeze the main thread on every launch
+                # click (the known spinner-starvation trap). Same two registry
+                # keys _set_prefix_dpi documents. Restore happens in the exit
+                # poll via _tool_dpi_restore (registered at spawn below).
+                _tool_dpi = int(game.get("tool_dpi", 0) or 0)
+                _tool_dpi_wrapped = bool(game.get("is_tool")) and _tool_dpi > 0
+                if _tool_dpi_wrapped:
+                    _reg_cmds = []
+                    for _key in (r"HKEY_CURRENT_USER\Control Panel\Desktop",
+                                 r"HKEY_CURRENT_USER\Software\Wine\Fonts"):
+                        _reg_cmds.append(shlex.join(
+                            [umu_bin, "reg", "add", _key,
+                             "/v", "LogPixels", "/t", "REG_DWORD",
+                             "/d", str(_tool_dpi), "/f"]) + " >/dev/null 2>&1")
+                    _script = "; ".join(_reg_cmds) + '; exec "$@"'
+                    cmd = ["/bin/sh", "-c", _script, "sh", *cmd]
+                    _NAGOLog.launch(f"tool DPI       LogPixels={_tool_dpi} (restored on exit)")
 
             # Set the working directory to the game's folder so it can find its own
             # data files (configs/assets sitting next to the exe).
@@ -17225,10 +20191,10 @@ class LibraryPage(QWidget):
             # the flag is dropped so they don't crash on launch.
             if _gamescope_active:
                 _gs_bin = shutil.which("gamescope")  # already confirmed truthy via _gamescope_active
-                _gs_w, _gs_h, _gs_r = _gamescope_resolution()
+                _gs_w, _gs_h, _gs_r = prep["gamescope_res"] or (1920, 1080, 60)
                 _gs_cmd = [_gs_bin, "-W", str(_gs_w), "-H", str(_gs_h), "-r", str(_gs_r), "-f"]
                 if game.get("hdr_enabled") and not game.get("upscale_enabled"):
-                    if _gamescope_supports_hdr():
+                    if prep["gamescope_hdr_ok"]:
                         _gs_cmd.append("--hdr-enabled")
                     else:
                         _NAGOLog.launch("[warn] installed gamescope doesn't support --hdr-enabled; HDR signalling skipped (upgrade to v3.13+)")
@@ -17361,14 +20327,11 @@ class LibraryPage(QWidget):
             # connector list computed at the top of _launch_game.
             _post_cmd_base = (game.get("post_exit_cmd") or "").strip()
 
-            # HDR disable — appended with `;` (not `&&`) so HDR is restored to SDR
-            # even when the user's post-exit command returns non-zero (or is empty).
-            # NAGO never turns HDR off otherwise, so without this the kscreen-doctor
-            # mode flip applied at launch persists until the next manual change.
-            # Steam is already excluded upstream (_hdr_will_fire is False for steam).
-            if _hdr_post_cmd:
-                _post_cmd_base = (f"{_post_cmd_base} ; {_hdr_post_cmd}"
-                                  if _post_cmd_base else _hdr_post_cmd)
+            # HDR disable is NO LONGER glued into the post-exit cmd string.
+            # It's tracked separately in self._hdr_games (gid → disable cmd)
+            # so the poll loop can defer the SDR restore while another HDR
+            # game is still running. Steam is excluded upstream
+            # (_hdr_will_fire is False for steam → _hdr_post_cmd is "").
             if game["game_type"] == "steam":
                 appid = (game.get("exe_path") or "").strip()
                 if appid:
@@ -17389,7 +20352,11 @@ class LibraryPage(QWidget):
                     # Don't set_running yet — /proc scan will confirm when up.
             else:
                 self._running_games[game["id"]] = (proc, _post_cmd_base, bool(game.get("auto_backup")))
+                if locals().get("_tool_dpi_wrapped"):
+                    self._tool_dpi_restore[game["id"]] = (umu_bin, env)
                 self._session_starts[game["id"]] = time.monotonic()
+                if _hdr_post_cmd:
+                    self._hdr_games[game["id"]] = _hdr_post_cmd
                 if game["id"] in self._cards:
                     try:
                         self._cards[game["id"]].set_running(True)
@@ -17397,6 +20364,9 @@ class LibraryPage(QWidget):
                         pass
 
             self.status_message.emit(f"Launched: {game['name']}  (log: {log_path.name})")
+            # Both tracking inserts (_running_games / _steam_watched) happen in
+            # the if/else above — (re)start the exit-poll here, once, for both.
+            self._ensure_poll_running()
             self.game_launched.emit(str(log_path))
 
             # Update last played
@@ -17420,6 +20390,21 @@ class LibraryPage(QWidget):
             _NAGOLog.launch(f"  {e}")
             _NAGOLog.launch(_tb_str.strip())
             _NAGOLog.launch("=" * 64)
+            # HDR was already enabled in phase-1 prep — restore SDR on the
+            # crash path, or the monitor stays in HDR with no running game to
+            # trigger the restore. Guarded exactly like the umu-missing path:
+            # skip if the game got registered (its exit handles it) or another
+            # HDR game is running (it owns the restore at its exit).
+            _hdr_abort_cmd = locals().get("_hdr_post_cmd") or prep.get("hdr_post_cmd") or ""
+            if (_hdr_abort_cmd and gid not in self._hdr_games
+                    and not self._hdr_games):
+                try:
+                    subprocess.Popen(_hdr_abort_cmd, shell=True,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    _NAGOLog.launch("HDR restore    launch failed — back to SDR")
+                except Exception:
+                    pass
             # Also write to the per-game log file if it was opened before the crash
             _lf = locals().get("log_file")
             if _lf is not None:
@@ -17431,10 +20416,11 @@ class LibraryPage(QWidget):
                     pass
             if isinstance(e, FileNotFoundError):
                 _exe = (game.get("exe_path") or "") if isinstance(game, dict) else ""
+                _tn = "Tool" if (isinstance(game, dict) and game.get("is_tool")) else "Game"
                 _user_msg = (
-                    f"Game executable not found:\n{_exe}\n\nCheck the path in Edit \u2192 Game."
+                    f"{_tn} executable not found:\n{_exe}\n\nCheck the path in Edit."
                     if _exe else
-                    "Game executable not found. Check the path in Edit \u2192 Game."
+                    f"{_tn} executable not found. Check the path in Edit."
                 )
             elif isinstance(e, PermissionError):
                 _exe = (game.get("exe_path") or "") if isinstance(game, dict) else ""
@@ -17447,6 +20433,11 @@ class LibraryPage(QWidget):
             else:
                 _user_msg = str(e) + "\n\nSee Game Log for details."
             NAGOMessageBox.critical(None, "Launch Error", _user_msg)
+        finally:
+            # Clear the phase-1 guard on every exit path — success, early
+            # return (missing umu/steam/appid), or exception. From here the
+            # game is either in _running_games/_steam_watched or not launching.
+            self._launching_games.discard(gid)
 
     def _auto_backup_game(self, gid: int) -> None:
         """
@@ -17638,6 +20629,12 @@ class LibraryPage(QWidget):
         find_worker.start()
         self._auto_bk_workers.setdefault(gid, []).append(find_worker)
 
+    def _ensure_poll_running(self):
+        """Start the exit-poll timer if it isn't already running.
+        Called whenever a game is added to _running_games or _steam_watched."""
+        if not self._poll_timer.isActive():
+            self._poll_timer.start()
+
     def _poll_running_games(self):
         """Detect games that have exited and clean up trackers + UI.
         Runs the per-game post-exit command if one is configured.
@@ -17660,6 +20657,14 @@ class LibraryPage(QWidget):
                     exited.append((gid, post_cmd, do_auto_bk, None))
             for gid, post_cmd, do_auto_bk, _exit_code in exited:
                 self._running_games.pop(gid, None)
+                # Tool DPI restore — delete LogPixels in a daemon thread (the
+                # umu call takes seconds; blocking the poll loop here would
+                # freeze the UI). _restore_prefix_dpi swallows its own errors.
+                _dpi_info = self._tool_dpi_restore.pop(gid, None)
+                if _dpi_info:
+                    threading.Thread(target=_restore_prefix_dpi,
+                                     args=_dpi_info, daemon=True).start()
+                    _NAGOLog.launch(f"tool DPI       restore fired for game {gid}")
                 # ── Accumulate playtime ───────────────────────────────────
                 start = self._session_starts.pop(gid, None)
                 elapsed_min = 0
@@ -17754,6 +20759,21 @@ class LibraryPage(QWidget):
                     except Exception as e:
                         self.status_message.emit(f"Post-exit command failed: {e}")
                         _NAGOLog.launch(f"[error] Post-exit command failed: {e}  cmd={post_cmd}")
+                # HDR restore — only when this was the LAST running HDR game.
+                # Another HDR game still up keeps the monitor in HDR; its own
+                # exit (or the last one's) fires the restore instead.
+                _hdr_disable = self._hdr_games.pop(gid, None)
+                if _hdr_disable:
+                    if self._hdr_games:
+                        _NAGOLog.launch("HDR restore    deferred — another HDR game is still running")
+                    else:
+                        try:
+                            subprocess.Popen(_hdr_disable, shell=True,
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+                            _NAGOLog.launch("HDR restore    started (back to SDR)")
+                        except Exception as e:
+                            _NAGOLog.launch(f"[error] HDR restore failed: {e}")
                 # Kill upscaler if one was started for this game
                 _up = self._upscale_procs.pop(gid, None)
                 if _up is not None:
@@ -17765,6 +20785,10 @@ class LibraryPage(QWidget):
 
         # ── Steam: /proc-based tracking ───────────────────────────────────
         if not self._steam_watched:
+            # Nothing tracked on either path — park the timer until the next
+            # launch (_ensure_poll_running restarts it).
+            if not self._running_games:
+                self._poll_timer.stop()
             return
 
         running_appids = get_running_steam_appids()
@@ -17879,7 +20903,8 @@ class LibraryPage(QWidget):
                     # HDR-disable still needs to run. Computed fresh on a
                     # background thread inside the helper itself, so this
                     # never blocks the poll-loop/UI thread.
-                    _fire_steam_exit_post_cmd_async(post_cmd, identifier=appid)
+                    _fire_steam_exit_post_cmd_async(post_cmd, identifier=appid,
+                                                    skip_hdr=bool(self._hdr_games))
                 else:
                     if time.monotonic() - launched_at > STEAM_LAUNCH_GRACE:
                         self._steam_watched.pop(appid, None)
@@ -17887,6 +20912,10 @@ class LibraryPage(QWidget):
                         self.status_message.emit(
                             f"Steam game {appid} did not start within {int(STEAM_LAUNCH_GRACE)}s."
                         )
+
+        # Last tracked game exited (or timed out) this tick — park the timer.
+        if not self._running_games and not self._steam_watched:
+            self._poll_timer.stop()
 
     def _game_log_path(self, game: dict) -> Path:
         """Compute the per-game log file path."""
@@ -17972,6 +21001,12 @@ class LibraryPage(QWidget):
         dlg = GameDialog(self.config, game, self.parent())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             d = dlg.result_data
+            # Detect a Library<->Tools conversion so we can refresh the grid:
+            # a game turned into a tool must disappear from the Library, and a
+            # tool turned back into a game must reappear. reload() re-reads with
+            # the is_tool=0 filter, so a full rebuild does both.
+            _was_tool = bool(game.get("is_tool"))
+            _now_tool = bool(d.get("is_tool"))
             con = db_con()
             con.execute("""
                 UPDATE games SET name=?, exe_path=?, game_type=?, proton_path=?,
@@ -17986,7 +21021,9 @@ class LibraryPage(QWidget):
                                  upscale_enabled=?, upscale_model=?,
                                  hdr_enabled=?, hdr_monitor=?, gog_id=?,
                                  fsr4_upgrade=?, optiscaler_dll=?, fsr4_indicator=?,
-                                 mangohud_enabled=?, rating=?
+                                 mangohud_enabled=?, rating=?, store_url=?,
+                                 install_dir=?,
+                                 is_tool=?, tool_dpi=?
                 WHERE id=?
             """, (d["name"], d["exe_path"], d["game_type"], d["proton_path"],
                   d["umu_enabled"], d["umu_gameid"], d["umu_store"],
@@ -18001,14 +21038,72 @@ class LibraryPage(QWidget):
                   d.get("upscale_enabled", 0), d.get("upscale_model", "fast"),
                   d.get("hdr_enabled", 0), d.get("hdr_monitor", ""), d.get("gog_id", ""),
                   d.get("fsr4_upgrade", ""), d.get("optiscaler_dll", ""), d.get("fsr4_indicator", 0),
-                  d.get("mangohud_enabled", 0), d.get("rating", 0),
+                  d.get("mangohud_enabled", 0), d.get("rating", 0), d.get("store_url", ""),
+                  d.get("install_dir", ""),
+                  d.get("is_tool", 0), d.get("tool_dpi", 0),
                   game["id"]))
             con.commit()
             con.close()
+            # Wine Prefix dropdown (Edit Tool only). Two cases:
+            #   - an explicit choice (existing row or Browse for Prefix) →
+            #     pin it directly, prefix_owned=0. Repointing is a silent
+            #     detach — nothing on disk is touched, matches Edit's other
+            #     "just overwrite the pointer" fields.
+            #   - dropdown back on "New Prefix" AND this tool previously
+            #     referenced something else (prefix_owned was 0) → the user
+            #     is reversing a share; give it back a fresh canonical prefix
+            #     of its own. If it was already owned (never shared), this
+            #     is a no-op — don't touch a perfectly good existing pin.
+            if d.get("is_tool"):
+                _prefix_choice = (d.get("_prefix_dropdown_choice") or "").strip()
+                if _prefix_choice:
+                    try:
+                        _pcon = db_con()
+                        _pcon.execute(
+                            "UPDATE games SET prefix_path=?, prefix_owned=0 WHERE id=?",
+                            (_prefix_choice, game["id"]))
+                        _pcon.commit()
+                        _pcon.close()
+                        _NAGOLog.session(
+                            f"[edit-game] tool '{d['name']}' now shares prefix: {_prefix_choice}")
+                    except Exception as _pe:
+                        _NAGOLog.session(f"[warn] _edit_game: failed to pin shared prefix_path: {_pe}")
+                else:
+                    _prev_owned = (bool(int(game.get("prefix_owned", 1) or 0))
+                                   if game.get("prefix_owned") is not None else True)
+                    if not _prev_owned:
+                        try:
+                            _fresh_pfx = str(derive_prefix_path(d["name"], game["id"]))
+                            _pcon = db_con()
+                            _pcon.execute(
+                                "UPDATE games SET prefix_path=?, prefix_owned=1 WHERE id=?",
+                                (_fresh_pfx, game["id"]))
+                            _pcon.commit()
+                            _pcon.close()
+                            _NAGOLog.session(
+                                f"[edit-game] tool '{d['name']}' reverted to its own prefix: {_fresh_pfx}")
+                        except Exception as _pe:
+                            _NAGOLog.session(f"[warn] _edit_game: failed to revert to owned prefix: {_pe}")
+            # Manually edited playtime — separate targeted write, only when
+            # the dialog staged one (key absent otherwise, see result_data).
+            if "playtime_minutes" in d:
+                _ptcon = db_con()
+                try:
+                    _ptcon.execute("UPDATE games SET playtime_minutes=? WHERE id=?",
+                                   (int(d["playtime_minutes"]), game["id"]))
+                    _ptcon.commit()
+                finally:
+                    _ptcon.close()
+                _NAGOLog.session(
+                    f'[edit-game] "{d["name"]}" playtime manually set to '
+                    f'{int(d["playtime_minutes"])} min'
+                )
             # Update the card in-place — no full rebuild, no flash.
             card = self._cards.get(game["id"])
             if card:
                 card.update_game_data(d)
+                if "playtime_minutes" in d:
+                    card.update_playtime(int(d["playtime_minutes"]))
             # Refresh cover if it changed — re-read from DB to get the committed path
             con2 = db_con()
             try:
@@ -18027,11 +21122,21 @@ class LibraryPage(QWidget):
                     g.update(d)
                     g["cover_path"] = new_cover
                     break
+            # Library<->Tools conversion: full rebuild so the card appears in or
+            # disappears from the Library grid to match its new is_tool state.
+            if _was_tool != _now_tool:
+                self.reload()
+                # Rebuild the sibling grid too — the entry must appear on the
+                # page it just moved to, not only vanish from this one.
+                self.converted.emit()
 
     def _delete_game(self, gid: int):
+        _noun = "tool" if self._is_tool else "game"
         reply = NAGOMessageBox.question(
-            self, "Remove Game",
-            "Remove this game from your library?\n(The game files won't be deleted.)"
+            self, "Remove Tool" if self._is_tool else "Remove Game",
+            f"Remove this {_noun} from your "
+            f"{'Tools list' if self._is_tool else 'library'}?\n"
+            f"(The {_noun} files won't be deleted.)"
         )
         if reply == QMessageBox.StandardButton.Yes:
             con = db_con()
@@ -18082,7 +21187,7 @@ class LibraryPage(QWidget):
                 if _pfx_override_stripped:
                     _pfx_path = _pfx_override_stripped
                 else:
-                    _pfx_path = str(get_prefixes_root() / f"{slugify(_name)}_{gid}")
+                    _pfx_path = str(derive_prefix_path(_name, gid))
                 # Only archive the prefix path if the folder actually exists on disk.
                 # An empty/nonexistent path is useless to restore.
                 if not Path(_pfx_path).exists():
@@ -18129,6 +21234,10 @@ class LibraryPage(QWidget):
                     _NAGOLog.session(f"[warn] _delete_game: failed to delete cover for game {gid}: {e}")
             # we no longer have a card to display its state on.
             self._running_games.pop(gid, None)
+            _dpi_info = self._tool_dpi_restore.pop(gid, None)
+            if _dpi_info:
+                threading.Thread(target=_restore_prefix_dpi,
+                                 args=_dpi_info, daemon=True).start()
             to_remove = [appid for appid, entry in self._steam_watched.items()
                          if entry[0] == gid]
             for appid in to_remove:
@@ -18245,36 +21354,106 @@ class LibraryPage(QWidget):
         self.status_message.emit(f"Force-terminated {gname}")
 
     def _delete_prefix(self, game: dict):
-        """Delete the WINEPREFIX for a Proton/GOG game after confirmation."""
-        import shutil
+        """Delete the WINEPREFIX for a game or tool after confirmation.
+
+        Games: unchanged behaviour — a game always owns and deletes its own
+        prefix directly.
+
+        Tools: never hard-blocked, but the warning always names who actually
+        owns the prefix about to be removed, since a tool's prefix may be a
+        reference to another Tool's or Game's prefix (see the Wine Prefix
+        dropdown in Add/Edit Tool). That correctly-named warning is the
+        safety mechanism — there's no separate backup step.
+
+        Deletion itself always goes through the desktop's real trash (gio),
+        not a hard rmtree — restorable like any other delete, for games and
+        tools alike.
+        """
         gid   = game["id"]
         gname = game.get("name", "Game")
-        # Use prefix_path override if set, else derive from game id/name
-        _pfx_override = (game.get("prefix_path") or "").strip()
-        pfx = Path(_pfx_override) if _pfx_override else (
-            get_prefixes_root() / f"{slugify(gname)}_{gid}")
+        is_tool = bool(game.get("is_tool"))
+        # Resolve the exact prefix this row uses — id-anchored, never a
+        # slug-prefix guess, so a sibling's prefix can't be targeted.
+        pfx = resolve_prefix(game, persist=False)
+        pfx_str = str(pfx)
 
-        # Confirmation dialog with red save-game warning
+        if not is_tool:
+            warn_html = (
+                f"Delete the Wine prefix for <b>{gname}</b>?<br><br>"
+                f"This will permanently remove all Wine configuration, "
+                f"installed runtime files, and any "
+                f"<span style='color:#ef4444;font-weight:600;'>save files</span> "
+                f"stored inside the prefix.<br><br>"
+                f"<code>{pfx_str}</code><br><br>"
+                f"<b>This cannot be undone.</b>"
+            )
+        else:
+            owned = bool(int(game.get("prefix_owned", 1) or 0)) if game.get("prefix_owned") is not None else True
+            if not owned:
+                # This tool is a reference — find who it actually points at.
+                # One message regardless of whether the owner is a Game or
+                # another Tool: naming it correctly is what matters.
+                owners = find_prefix_references(pfx_str, exclude_id=gid)
+                owner = owners[0] if owners else None
+                if owner is None:
+                    warn_html = (
+                        f"Delete the Wine prefix used by <b>{gname}</b>?<br><br>"
+                        f"This prefix isn't tracked as belonging to any other Tool "
+                        f"or Game in NAGO — deleting it removes it "
+                        f"<span style='color:#ef4444;font-weight:600;'>entirely</span>."
+                        f"<br><br><code>{pfx_str}</code><br><br>"
+                        f"<b>This cannot be undone.</b>"
+                    )
+                else:
+                    warn_html = (
+                        f"<b>{gname}</b> doesn't have its own prefix — it uses "
+                        f"<b>{owner.get('name','another entry')}</b>'s prefix.<br><br>"
+                        f"Deleting it will delete "
+                        f"<b>{owner.get('name','that entry')}</b>'s prefix too, "
+                        f"including any files or "
+                        f"<span style='color:#ef4444;font-weight:600;'>saves</span> "
+                        f"stored there."
+                        f"<br><br><code>{pfx_str}</code><br><br>"
+                        f"<b>This cannot be undone.</b>"
+                    )
+            else:
+                # Owned by this tool — but another row may still be pointing
+                # at it (a Tool-chain: Tool B configured to use Tool A's
+                # prefix). Games can never reference a Tool's prefix, so any
+                # referencer found here is necessarily another Tool.
+                referencers = find_prefix_references(pfx_str, exclude_id=gid)
+                if referencers:
+                    names = ", ".join(r.get("name", "another Tool") for r in referencers[:3])
+                    if len(referencers) > 3:
+                        names += f", and {len(referencers) - 3} more"
+                    warn_html = (
+                        f"Delete the Wine prefix for <b>{gname}</b>?<br><br>"
+                        f"This prefix is also used by <b>{names}</b> — deleting it "
+                        f"removes their shared files too."
+                        f"<br><br><code>{pfx_str}</code><br><br>"
+                        f"<b>This cannot be undone.</b>"
+                    )
+                else:
+                    warn_html = (
+                        f"Delete the Wine prefix for <b>{gname}</b>?<br><br>"
+                        f"This will permanently remove all Wine configuration and "
+                        f"installed runtime files inside the prefix."
+                        f"<br><br><code>{pfx_str}</code><br><br>"
+                        f"<b>This cannot be undone.</b>"
+                    )
+
         box = NAGOMessageBox(
-            "warning",
-            "Delete Prefix",
-            f"Delete the Wine prefix for <b>{gname}</b>?<br><br>"
-            f"This will permanently remove all Wine configuration, "
-            f"installed runtime files, and any "
-            f"<span style='color:#ef4444;font-weight:600;'>save files</span> "
-            f"stored inside the prefix.<br><br>"
-            f"<code>{pfx}</code><br><br>"
-            f"<b>This cannot be undone.</b>",
-            parent=self,
-            buttons=("Delete", "Cancel"),
-            default_button="Cancel",
+            "warning", "Delete Prefix", warn_html,
+            parent=self, buttons=("Delete", "Cancel"), default_button="Cancel",
         )
         box.exec()
         if box.result_label() != "Delete":
             return
 
         try:
-            shutil.rmtree(pfx)
+            _how = _trash_or_delete_path(pfx)
+            if _how == "failed":
+                raise RuntimeError("neither trash nor hard-delete succeeded")
             self.status_message.emit(f"Prefix deleted: {gname}")
         except Exception as e:
             NAGOMessageBox(
@@ -18329,6 +21508,7 @@ class LibraryPage(QWidget):
         if not exe_path:
             return
         self.config["last_browse_dir"] = str(Path(exe_path).parent)
+        merge_save_config({"last_browse_dir": self.config["last_browse_dir"]})
 
         # Prefix resolution — override-or-derive, same as the dialog button.
         # get_game_prefix() creates the directory if it doesn't exist yet
@@ -18358,9 +21538,10 @@ class LibraryPage(QWidget):
             os.environ.copy(),
             wineprefix=pfx,
             proton_path=proton_arg,
-            game_id="umu-default",
+            game_id="",   # empty → build_umu_env omits GAMEID → umu defaults to umu-default (same convention as game launches)
             store="",
             extra_share_paths=[exe_path],
+            disable_protonfixes=True,  # arbitrary exe, no fixes wanted — see build_umu_env
         )
         raw_env = (game.get("env_vars") or "").strip()
         if raw_env:
@@ -18501,7 +21682,14 @@ class LibraryPage(QWidget):
         """Load and display a cover on a single card without a full reload."""
         if gid not in self._cards:
             return
-        tw = ThumbnailWorker([(gid, path)])
+        screen = self.screen() or QApplication.primaryScreen()
+        dpr    = screen.devicePixelRatio() if screen else 1.0
+        # Pass the CURRENT generation without incrementing — bumping it here
+        # would orphan an in-flight full-rebuild worker's remaining covers.
+        # Carrying the current gen means this refresh is correctly dropped in
+        # _on_thumb_loaded if a rebuild supersedes it before delivery.
+        tw = ThumbnailWorker([(gid, path)], CARD_W, COVER_H,
+                             COVER_RADIUS, dpr, self._thumb_gen)
         tw.loaded.connect(self._on_thumb_loaded)
         # Remove from the live-workers list only after the thread is fully done,
         # then let deleteLater clean up the Qt object.  Storing in a list (not a
@@ -18522,6 +21710,11 @@ class LibraryPage(QWidget):
                     p.unlink()
             except Exception as e:
                 _NAGOLog.session(f"[warn] _on_cover_downloaded: failed to delete old cover for game {gid}: {e}")
+        # Persist the new path — this write went missing at some point (the
+        # bare commit below was the tell). Without it the cover only lived in
+        # _all_games: Edit Game (which re-reads the DB) showed no cover, and
+        # Save Changes then wiped it off the card via _set_placeholder.
+        con.execute("UPDATE games SET cover_path=? WHERE id=?", (path, gid))
         con.commit()
         con.close()
         for g in self._all_games:
@@ -18550,6 +21743,9 @@ class LibraryPage(QWidget):
                         p.unlink()
                 except Exception as e:
                     _NAGOLog.session(f"[warn] _use_local_cover: failed to delete old cover for game {game.get('id')}: {e}")
+            # Persist — same lost write as _on_cover_downloaded (see there).
+            con.execute("UPDATE games SET cover_path=? WHERE id=?",
+                        (str(out_path), game["id"]))
             con.commit()
             con.close()
             for g in self._all_games:
@@ -18728,7 +21924,7 @@ class _ToastNotification(QWidget):
         self._hide_timer.start(duration)
 
     def _resize_to_text(self):
-        fm = QFontMetrics(QFont("Segoe UI", 11, QFont.Weight.Medium.value))
+        fm = QFontMetrics(QFont("Inter", 11, QFont.Weight.Medium.value))
         tw = fm.horizontalAdvance(self._msg)
         th = fm.height()
         # Add shadow room: 16px extra on each side
@@ -18785,7 +21981,7 @@ class _ToastNotification(QWidget):
         p.drawRoundedRect(rect, self._RADIUS, self._RADIUS)
 
         # Text
-        font = QFont("Segoe UI", 11, QFont.Weight.Medium.value)
+        font = QFont("Inter", 11, QFont.Weight.Medium.value)
         p.setFont(font)
         p.setPen(QColor("#e4e4e7"))
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._msg)
@@ -19216,6 +22412,115 @@ def _resolve_window_title_via_xprop(game_name: str, fallback: str) -> str:
 
 
 # ── Upscaler launch worker ─────────────────────────────────────────────────────
+class _LaunchPrepWorker(_NAGOThread):
+    """Phase-1 launch preparation, off the UI thread.
+
+    Runs every blocking pre-launch step that previously ran inline in
+    _launch_game on the Qt main thread: HDR tool probes (3s + 3s timeouts),
+    the HDR enable subprocess (15s), the user pre-launch command (30s), and
+    the gamescope probes (3s + 3s) — worst case ~57s of accumulated timeouts
+    that would freeze the whole UI if a tool hung. Results are handed to
+    _launch_game_phase2 on the main thread, which does everything
+    Qt-touching (Popen, card state, dialogs, DB writes).
+
+    Fail-soft throughout, matching the original inline behaviour: prep
+    errors are logged and surfaced as status messages, never block launch.
+    """
+    ready = pyqtSignal(dict)
+
+    def __init__(self, game: dict, parent=None):
+        super().__init__(parent)
+        self._game = game
+
+    def run(self):
+        game = self._game
+        prep: dict = {
+            "game": game, "warnings": [],
+            "hdr_will_fire": False, "hdr_tool_used": "",
+            "hdr_capable": [], "hdr_post_cmd": "",
+            "gamescope_active": False, "gamescope_res": None,
+            "gamescope_hdr_ok": False,
+        }
+        try:
+            # HDR launch state — computed once, used by pre-cmd build,
+            # post-cmd build, and the launch log (same logic as before).
+            # hdr_monitor is NOT required: the column is legacy (always "*"
+            # in new saves, ignored by _hdr_commands, connectors are always
+            # auto-detected) — requiring it silently no-op'd HDR for rows
+            # saved with an empty monitor by older builds.
+            _hdr_will_fire = (bool(game.get("hdr_enabled"))
+                              and not bool(game.get("upscale_enabled"))
+                              and game.get("game_type") != "steam")
+            _hdr_capable_list: list = []
+            _hdr_tool_used = ""
+            _hdr_post_cmd  = ""
+            if _hdr_will_fire:
+                _use_ksd, _use_gdct = _hdr_tool_choice()
+                _hdr_tool_used = ("kscreen-doctor" if _use_ksd
+                                  else "gdctl" if _use_gdct else "")
+                if _hdr_tool_used:
+                    _hdr_capable_list = _hdr_capable_connectors()
+
+            # HDR enable — its own subprocess BEFORE the user pre_cmd so
+            # neither command can block the other. Steam-type excluded
+            # upstream via _hdr_will_fire.
+            if _hdr_will_fire and _hdr_capable_list:
+                _hdr_pre, _hdr_post_cmd = _hdr_commands(
+                    game.get("hdr_monitor") or "*", connectors=_hdr_capable_list)
+                if _hdr_pre:
+                    try:
+                        subprocess.run(_hdr_pre, shell=True, timeout=15,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                    except subprocess.TimeoutExpired:
+                        _NAGOLog.launch("[warn] HDR enable timed out (15s)")
+                    except Exception as e:
+                        _NAGOLog.launch(f"[warn] HDR enable failed: {e}")
+
+            # Pre-launch hook — failures logged and surfaced, never block.
+            pre_cmd = (game.get("pre_launch_cmd") or "").strip()
+            if pre_cmd:
+                try:
+                    subprocess.run(pre_cmd, shell=True, timeout=30,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                except subprocess.TimeoutExpired:
+                    prep["warnings"].append("Pre-launch command timed out (30s)")
+                    _NAGOLog.launch(f"[warn] Pre-launch command timed out (30s): {pre_cmd}")
+                except Exception as e:
+                    prep["warnings"].append(f"Pre-launch command failed: {e}")
+                    _NAGOLog.launch(f"[error] Pre-launch command failed: {e}  cmd={pre_cmd}")
+
+            # Gamescope — resolve binary + probe resolution/HDR support here
+            # (kscreen-doctor / gamescope --help subprocesses, 3s each).
+            _gamescope_active = (
+                bool(game.get("gamescope_enabled", 0))
+                and game["game_type"] != "steam"
+                and bool(shutil.which("gamescope"))
+            )
+            _gs_res = None
+            _gs_hdr_ok = False
+            if _gamescope_active:
+                _gs_res = _gamescope_resolution()
+                if game.get("hdr_enabled") and not game.get("upscale_enabled"):
+                    _gs_hdr_ok = _gamescope_supports_hdr()
+
+            prep.update({
+                "hdr_will_fire":    _hdr_will_fire,
+                "hdr_tool_used":    _hdr_tool_used,
+                "hdr_capable":      _hdr_capable_list,
+                "hdr_post_cmd":     _hdr_post_cmd,
+                "gamescope_active": _gamescope_active,
+                "gamescope_res":    _gs_res,
+                "gamescope_hdr_ok": _gs_hdr_ok,
+            })
+        except Exception as e:
+            # Fail-soft: launch proceeds with safe defaults (no HDR/gamescope
+            # extras) rather than dying in prep.
+            _NAGOLog.launch(f"[warn] launch prep failed: {e}")
+        self.ready.emit(prep)
+
+
 class _UpscalerLaunchWorker(_NAGOThread):
     """
     Waits for a game window to appear, resolves its title via xprop, then
@@ -19520,16 +22825,16 @@ class MainWindow(QMainWindow):
         # Use the bundled NAGO logo as the window icon (taskbar / dock / Alt-Tab)
         if LOGO_PATH.exists():
             self.setWindowIcon(QIcon(str(LOGO_PATH)))
-        # Minimum size of 1025x750 in logical points. Clamp to the available
+        # Minimum size of 1020x715 in logical points. Clamp to the available
         # screen size so the window stays usable on small / high-DPI displays
         # (e.g. 1920x1080 at 200% scale = 960x540 logical points).
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
-            min_w = min(1065, max(640, avail.width()  - 40))
+            min_w = min(1020, max(640, avail.width()  - 40))
             min_h = min(715,  max(480, avail.height() - 80))
         else:
-            min_w, min_h = 1065, 715
+            min_w, min_h = 1020, 715
         self.setMinimumSize(min_w, min_h)
         # Restore saved window geometry, or use defaults. Wrapped in try/except so a
         # corrupted config.json (non-numeric width/height/x/y from a hand-edit or a
@@ -19625,7 +22930,7 @@ class MainWindow(QMainWindow):
             con = db_con()
             cols_desc = [d[0] for d in con.execute("SELECT * FROM games LIMIT 0").description]
             rows = con.execute(
-                "SELECT * FROM games WHERE last_played IS NOT NULL "
+                "SELECT * FROM games WHERE last_played IS NOT NULL AND is_tool=0 "
                 "ORDER BY last_played DESC LIMIT 5"
             ).fetchall()
             con.close()
@@ -19757,25 +23062,22 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Pull in any keys other parts of the app may have written (umu_version, etc.)
-        # so we don't overwrite them with our stale in-memory copy.
-        on_disk = load_config()
-        on_disk.update(self.config)
-        self.config = on_disk
-
         # Persist window geometry
         was_max = self.isMaximized()
         # When maximized, save the *normal* geometry so restore works on next launch
         geo = self.normalGeometry() if was_max else self.geometry()
-        self.config["window"] = {
+        # Merge-save ONLY the window key — self.config is a snapshot that may
+        # be older than what workers/dialogs wrote during this session. Saving
+        # it wholesale reverts their keys (umu_version, last_browse_dir, ...).
+        # See merge_save_config(). Refresh self.config so it stays consistent.
+        self.config = merge_save_config({"window": {
             "x":             geo.x(),
             "y":             geo.y(),
             "width":         geo.width(),
             "height":        geo.height(),
             "maximized":     was_max,
             "sidebar_width": self._sidebar.width(),
-        }
-        save_config(self.config)
+        }})
         super().closeEvent(event)
 
     def _build(self):
@@ -19872,6 +23174,20 @@ class MainWindow(QMainWindow):
         self.btn_library.setAutoExclusive(True)
         _nav_layout.addWidget(self.btn_library)
         self.btn_library.clicked.connect(self._show_library)
+
+        # Tools — top-level peer of Library. Same card grid, fed by is_tool=1
+        # (Windows launchers/mod managers running in their own Wine prefix).
+        # Shares the auto-exclusive nav cluster so it radio-groups with Library
+        # and Settings.
+        self.btn_tools = self._sidebar_btn("Tools")
+        # 'wrench' is in the embedded Phosphor subset; 'toolbox' is not (would
+        # render blank without re-subsetting the font). Wrench reads clearly as
+        # Tools and keeps a distinct silhouette from Library(stack)/Settings(gear).
+        self.btn_tools.setIcon(ph_icon("wrench", 20))
+        self.btn_tools.setCheckable(True)
+        self.btn_tools.setAutoExclusive(True)
+        _nav_layout.addWidget(self.btn_tools)
+        self.btn_tools.clicked.connect(self._show_tools)
 
         # Settings parent button — toggles sub-menu, doesn't navigate directly
         self.btn_settings = self._sidebar_btn("Settings")
@@ -20075,16 +23391,25 @@ class MainWindow(QMainWindow):
         # Stacked pages
         self.stack = QStackedWidget()
         self.library_page  = LibraryPage(self.config)
+        self.tools_page    = LibraryPage(self.config, is_tool=1)
         self.settings_page = SettingsPage(self.config)
         self.logs_page     = LogsPage()
         self.library_page.status_message.connect(self._set_status)
         self.library_page.game_launched.connect(self._on_game_launched)
+        self.tools_page.status_message.connect(self._set_status)
+        self.tools_page.game_launched.connect(self._on_game_launched)
+        # Library<->Tools conversion: the edited page rebuilds itself; the
+        # sibling page must rebuild too so the entry appears on / vanishes from
+        # the other grid. Cross-wire each page's converted signal to the other.
+        self.library_page.converted.connect(self.tools_page.reload)
+        self.tools_page.converted.connect(self.library_page.reload)
         self.settings_page.config_saved.connect(self._on_config_saved)
         # Wire prefix run bridge → live append in Run in Prefix log tab
         _prefix_run_bridge.line_ready.connect(self.logs_page.append_prefix_line)
         # Wire winetricks bridge → live append in Winetricks log tab
         _winetricks_bridge.line_ready.connect(self.logs_page.append_winetricks_line)
         self.stack.addWidget(self.library_page)
+        self.stack.addWidget(self.tools_page)
         self.stack.addWidget(self.settings_page)
         self.stack.addWidget(self.logs_page)
         _stack_wrapper = QWidget()
@@ -20212,9 +23537,14 @@ class MainWindow(QMainWindow):
     def _show_category(self, cat_id: int, cat_name: str):
         self._revert_unsaved_accent()
         self._collapse_settings_tree()
-        # Deselect nav buttons
-        self.btn_library.setChecked(False)
-        self.btn_settings.setChecked(False)
+        # Deselect nav buttons. Plain setChecked(False) is a no-op on the
+        # active button of an auto-exclusive group, so use the off/uncheck/on
+        # dance (same pattern used for the category buttons). Clears all three,
+        # including btn_tools when arriving from the Tools page.
+        for _b in (self.btn_library, self.btn_tools, self.btn_settings):
+            _b.setAutoExclusive(False)
+            _b.setChecked(False)
+            _b.setAutoExclusive(True)
         # Deselect other cat buttons
         for cid, b in self._cat_buttons.items():
             b.setChecked(cid == cat_id)
@@ -20223,12 +23553,20 @@ class MainWindow(QMainWindow):
         self.page_title.setText(cat_name)
         self.search_box.setVisible(True)
         self.add_btn.setVisible(True)
+        self.add_btn.setText("  Add Game")
         self._show_hidden_btn.setVisible(True)
-        self.library_page._apply_filter(
-            self.library_page._current_filter_text, cat_id)
-        # Persist for next launch
+        # _enter_grid resyncs the shared search box text and hidden toggle to
+        # the Library's own state — otherwise a filter typed on the Tools page
+        # would linger in the box while the Library filters by its own text.
+        self._enter_grid(self.library_page, cat_id)
+        # Persist for next launch — written immediately so a crash/kill before
+        # closeEvent still saves the last category. These keys were previously
+        # piggybacking on the old wholesale save_config(self.config) in
+        # closeEvent; that save was removed in the config-clobber fix (12-07),
+        # exposing that they were never explicitly persisted. 12-07.
         self.config["last_view"] = "category"
         self.config["last_category_id"] = cat_id
+        merge_save_config({"last_view": "category", "last_category_id": cat_id})
 
     def _cat_context_menu(self, pos, cat_id: int, btn: QPushButton):
         menu = QMenu(self)
@@ -20374,14 +23712,43 @@ class MainWindow(QMainWindow):
         self.btn_settings.setChecked(False)
         self.btn_settings_general.setChecked(False)
         self.btn_settings_logs.setChecked(False)
+        self.btn_tools.setChecked(False)
         self.page_title.setText("Library")
         self.search_box.setVisible(True)
         self.add_btn.setVisible(True)
+        self.add_btn.setText("  Add Game")
         self._show_hidden_btn.setVisible(True)
-        self.library_page._apply_filter(
-            self.library_page._current_filter_text, None)
+        self._enter_grid(self.library_page, None)
         self.config["last_view"] = "library"
         self.config["last_category_id"] = None
+        merge_save_config({"last_view": "library", "last_category_id": None})
+
+    def _show_tools(self):
+        """Tools grid — top-level peer of Library, fed by is_tool=1. Flat grid:
+        never wired to categories, so cat is always None."""
+        self._revert_unsaved_accent()
+        self._collapse_settings_tree()
+        self._active_cat_id = None
+        # Auto-exclusive blocks programmatic setChecked(False) — toggle off, uncheck, restore.
+        for b in self._cat_buttons.values():
+            b.setAutoExclusive(False)
+            b.setChecked(False)
+            b.setAutoExclusive(True)
+        self.stack.setCurrentWidget(self.tools_page)
+        self.btn_tools.setChecked(True)
+        self.btn_library.setChecked(False)
+        self.btn_settings.setChecked(False)
+        self.btn_settings_general.setChecked(False)
+        self.btn_settings_logs.setChecked(False)
+        self.page_title.setText("Tools")
+        self.search_box.setVisible(True)
+        self.add_btn.setVisible(True)
+        self.add_btn.setText("  Add Tool")
+        self._show_hidden_btn.setVisible(True)
+        self._enter_grid(self.tools_page, None)
+        self.config["last_view"] = "tools"
+        self.config["last_category_id"] = None
+        merge_save_config({"last_view": "tools", "last_category_id": None})
 
     def _toggle_settings_tree(self):
         """Expand or collapse the Settings sub-menu."""
@@ -20410,6 +23777,7 @@ class MainWindow(QMainWindow):
             b.setAutoExclusive(True)
         self.stack.setCurrentWidget(self.settings_page)
         self.btn_library.setChecked(False)
+        self.btn_tools.setChecked(False)
         self.btn_settings.setChecked(True)
         self.btn_settings_general.setChecked(True)
         self.btn_settings_logs.setChecked(False)
@@ -20425,6 +23793,7 @@ class MainWindow(QMainWindow):
         self.logs_page.refresh()
         self.stack.setCurrentWidget(self.logs_page)
         self.btn_library.setChecked(False)
+        self.btn_tools.setChecked(False)
         self.btn_settings.setChecked(True)
         self.btn_settings_general.setChecked(False)
         self.btn_settings_logs.setChecked(True)
@@ -20437,6 +23806,9 @@ class MainWindow(QMainWindow):
         """Restore the view the user had open last time. Falls back to Library."""
         last_view = self.config.get("last_view", "library")
         last_cat  = self.config.get("last_category_id")
+        if last_view == "tools":
+            self._show_tools()
+            return
         if last_view == "category" and last_cat is not None:
             # Look up the category's current name (names can be renamed but ids are stable)
             try:
@@ -20452,14 +23824,60 @@ class MainWindow(QMainWindow):
         # Default — also covers the "settings was the last view" case
         self._show_library()
 
+    def _active_grid(self):
+        """The card grid the shared top-bar controls (search, hidden toggle)
+        act on: the Tools page when it's showing, else the Library page.
+        Settings/Logs aren't grids, so those fall back to Library."""
+        w = self.stack.currentWidget()
+        return w if isinstance(w, LibraryPage) else self.library_page
+
+    def _grid_nouns(self, grid):
+        """(page_noun, item_noun) for top-bar strings. Library keeps its
+        established wording ('library' page / 'games' items); Tools is 'tools'
+        for both."""
+        if grid is self.tools_page:
+            return ("tools", "tools")
+        return ("library", "games")
+
+    def _sync_topbar_hidden(self, grid):
+        """Sync the eye button + search placeholder to a grid's own
+        _show_hidden state (each grid tracks it independently). Signals are
+        blocked so setting the checkbox doesn't re-fire the toggle handler."""
+        page_noun, item_noun = self._grid_nouns(grid)
+        checked = bool(grid._show_hidden)
+        self._show_hidden_btn.blockSignals(True)
+        self._show_hidden_btn.setChecked(checked)
+        self._show_hidden_btn.blockSignals(False)
+        if checked:
+            self._show_hidden_btn.setIcon(ph_icon("eye", 20))
+            self._show_hidden_btn.setToolTip(f"Back to {page_noun}")
+            self.search_box.setPlaceholderText(f"Search hidden {item_noun}…")
+        else:
+            self._show_hidden_btn.setIcon(ph_icon("eye-slash", 20))
+            self._show_hidden_btn.setToolTip(f"Show hidden {item_noun}")
+            self.search_box.setPlaceholderText(f"Search {item_noun}…")
+
+    def _enter_grid(self, grid, cat):
+        """On page switch: point the shared search box at the target grid's own
+        filter text, sync the hidden toggle, and reflow. Tools always passes
+        cat=None (flat grid, never wired to categories)."""
+        self._sync_topbar_hidden(grid)
+        self.search_box.blockSignals(True)
+        self.search_box.setText(grid._current_filter_text)
+        self.search_box.blockSignals(False)
+        grid._apply_filter(grid._current_filter_text, cat)
+
     def _on_search(self, text: str):
         if not hasattr(self, "_search_timer"):
             self._search_timer = QTimer(self)
             self._search_timer.setSingleShot(True)
-            self._search_timer.timeout.connect(
-                lambda: self.library_page._apply_filter(
-                    self.search_box.text(), self._active_cat_id))
+            self._search_timer.timeout.connect(self._run_active_search)
         self._search_timer.start(150)
+
+    def _run_active_search(self):
+        grid = self._active_grid()
+        cat = self._active_cat_id if grid is self.library_page else None
+        grid._apply_filter(self.search_box.text(), cat)
 
     def _apply_hidden_btn_style(self, accent: str):
         """Build the eye-button stylesheet using the current accent color and theme."""
@@ -20495,22 +23913,42 @@ class MainWindow(QMainWindow):
             self._show_hidden_btn.setStyleSheet("")
 
     def _on_toggle_show_hidden(self, checked: bool):
-        """Toggle the library between normal and hidden-games view."""
-        self.library_page._show_hidden = checked
+        """Toggle the active grid between normal and hidden view. The eye
+        button is a single shared control; it acts on whichever grid is
+        showing, and each grid keeps its own _show_hidden state."""
+        grid = self._active_grid()
+        grid._show_hidden = checked
+        page_noun, item_noun = self._grid_nouns(grid)
         if checked:
             self._show_hidden_btn.setIcon(ph_icon("eye", 20))
-            self._show_hidden_btn.setToolTip("Back to library")
-            self.search_box.setPlaceholderText("Search hidden games…")
+            self._show_hidden_btn.setToolTip(f"Back to {page_noun}")
+            self.search_box.setPlaceholderText(f"Search hidden {item_noun}…")
         else:
             self._show_hidden_btn.setIcon(ph_icon("eye-slash", 20))
-            self._show_hidden_btn.setToolTip("Show hidden games")
-            self.search_box.setPlaceholderText("Search games…")
-        self.library_page._apply_filter(self.search_box.text(), self._active_cat_id)
+            self._show_hidden_btn.setToolTip(f"Show hidden {item_noun}")
+            self.search_box.setPlaceholderText(f"Search {item_noun}…")
+        cat = self._active_cat_id if grid is self.library_page else None
+        grid._apply_filter(self.search_box.text(), cat)
 
     def _add_game(self):
-        dlg = GameDialog(self.config, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        # Location-based classification: adding from the Tools page adds a
+        # tool; anywhere else adds a game.
+        _as_tool = self.stack.currentWidget() is self.tools_page
+        dlg = GameDialog(self.config, parent=self, as_tool=_as_tool)
+        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        # The modal grabbed input; if the mouse left while it was up, the
+        # button never received Leave and :hover sticks. Clear it either way.
+        self._resync_hover(self.add_btn)
+        if _accepted:
             d = dlg.result_data
+            # One-time store URL auto-fill at add: Steam games keep their AppID
+            # in exe_path — derive the store page from it when the user didn't
+            # supply a URL. Written to the DB here; freely editable afterwards
+            # in Edit Game → Advanced (never re-derived or overwritten).
+            _store_url = (d.get("store_url") or "").strip()
+            if not _store_url and d["game_type"] == "steam" and d["exe_path"].strip().isdigit():
+                _store_url = f"https://store.steampowered.com/app/{d['exe_path'].strip()}/"
+            d["store_url"] = _store_url
             con = db_con()
             try:
                 con.execute("""
@@ -20527,10 +23965,13 @@ class MainWindow(QMainWindow):
                                        hdr_enabled, hdr_monitor,
                                        gog_id,
                                        fsr4_upgrade, optiscaler_dll, fsr4_indicator,
-                                       install_dir,
+                                       install_dir, store_url, is_tool,
+                                       tool_dpi,
                                        sort_pos, added_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?,
+                            ?, ?, ?,
+                            ?,
+                            ?,
                             (SELECT COALESCE(MAX(sort_pos), 0) + 1 FROM games),
                             datetime('now'))
                 """, (d["name"], d["exe_path"], d["game_type"], d["proton_path"],
@@ -20547,9 +23988,38 @@ class MainWindow(QMainWindow):
                       d.get("hdr_enabled", 0), d.get("hdr_monitor", ""),
                       d.get("gog_id", ""),
                       d.get("fsr4_upgrade", ""), d.get("optiscaler_dll", ""), d.get("fsr4_indicator", 0),
-                      d.get("install_dir", "")))
+                      d.get("install_dir", ""), d.get("store_url", ""),
+                      d.get("is_tool", 0),
+                      d.get("tool_dpi", 0)))
                 con.commit()
                 new_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                # Remember whether this entry belongs to the Tools grid so the
+                # post-add view switch lands on the page that shows it.
+                self._added_is_tool = bool(d.get("is_tool", 0))
+
+                # Wine Prefix dropdown (Add Tool): an explicit existing-prefix
+                # choice is pinned immediately, before ANY of the tmp-prefix
+                # rename / canonical-pin / archive-restore / orphan-scan logic
+                # below can run — all four of those are guarded off when this
+                # is set, since they exist to give a row ITS OWN prefix, which
+                # is exactly what an explicit share overrides. Known gap: if
+                # Run in Prefix was also used during this Add (installing into
+                # a tmp prefix before Save), that tmp prefix is intentionally
+                # left untouched/orphaned here rather than silently pinned or
+                # deleted — installing into a shared prefix via Run in Prefix
+                # during Add isn't wired yet.
+                _prefix_override_path = (d.get("_prefix_dropdown_choice") or "").strip()
+                _prefix_override_applied = bool(_prefix_override_path)
+                if _prefix_override_applied:
+                    try:
+                        con.execute(
+                            "UPDATE games SET prefix_path=?, prefix_owned=0 WHERE id=?",
+                            (_prefix_override_path, new_id))
+                        con.commit()
+                        _NAGOLog.session(
+                            f"[add-game] pinned shared prefix for tool: {_prefix_override_path}")
+                    except Exception as _pe:
+                        _NAGOLog.session(f"[warn] _add_game: failed to pin shared prefix_path for game {new_id}: {_pe}")
                 _NAGOLog.session(
                     f'[add-game] "{d["name"]}"'
                 )
@@ -20611,13 +24081,40 @@ class MainWindow(QMainWindow):
                 # block below knows a fresh install prefix already exists.
                 _installed_pfx = ""
                 tmp_pfx = d.get("tmp_prefix_path", "")
-                if tmp_pfx and Path(tmp_pfx).exists():
-                    slug     = slugify(d["name"])
-                    real_pfx = get_prefixes_root() / f"{slug}_{new_id}"
+                if tmp_pfx and Path(tmp_pfx).exists() and not _prefix_override_applied:
+                    real_pfx = derive_prefix_path(d["name"], new_id)
                     try:
                         Path(tmp_pfx).rename(real_pfx)
                         con.execute("UPDATE games SET prefix_path=? WHERE id=?",
                                     (str(real_pfx), new_id))
+                        # exe_path may point INSIDE the prefix just renamed — a
+                        # Proton install writes the program into drive_c, and
+                        # Stage 3a auto-fills exactly such a path. Remap it or
+                        # the entry launches nothing. Only on a successful
+                        # rename; the except branch keeps tmp_pfx, still valid.
+                        _new_exe = _remap_prefix_path(d.get("exe_path", ""),
+                                                      tmp_pfx, str(real_pfx))
+                        if _new_exe:
+                            con.execute("UPDATE games SET exe_path=? WHERE id=?",
+                                        (_new_exe, new_id))
+                            # Keep the in-memory row in sync — it feeds the
+                            # playtime-archive lookup further down.
+                            d["exe_path"] = _new_exe
+                            _NAGOLog.session(
+                                f"[add-game] exe_path remapped into renamed prefix: {_new_exe}")
+                        # install_dir was derived FROM that in-prefix exe
+                        # (_auto_populate_install_dir), so it points into the
+                        # tmp prefix too — remap it the same way or the DB
+                        # keeps a dead folder path that Edit (Proton) never
+                        # surfaces, so the user could never see or fix it.
+                        _new_inst = _remap_prefix_path(d.get("install_dir", ""),
+                                                       tmp_pfx, str(real_pfx))
+                        if _new_inst:
+                            con.execute("UPDATE games SET install_dir=? WHERE id=?",
+                                        (_new_inst, new_id))
+                            d["install_dir"] = _new_inst
+                            _NAGOLog.session(
+                                f"[add-game] install_dir remapped into renamed prefix: {_new_inst}")
                         con.commit()
                         _installed_pfx = str(real_pfx)
                         _NAGOLog.session(f"[add-game] tmp prefix renamed: {tmp_pfx} → {real_pfx}")
@@ -20628,6 +24125,22 @@ class MainWindow(QMainWindow):
                         con.commit()
                         _installed_pfx = tmp_pfx
                         _NAGOLog.session(f"[warn] _add_game: prefix rename failed, keeping tmp path {tmp_pfx}: {e}")
+
+                # No tmp prefix (normal Add) — pin the canonical prefix path now
+                # so every later read is direct (no scan) and rename-proof; the
+                # folder itself is bootstrapped by umu on first launch. Skipped
+                # for native/steam (no Wine prefix) and when a tmp prefix already
+                # set the path above. The archive-restore/orphan passes below may
+                # still override this with a recovered prefix, which is correct.
+                if not _installed_pfx and not _prefix_override_applied and d["game_type"] in ("proton", "gog"):
+                    _canon_pfx = str(derive_prefix_path(d["name"], new_id))
+                    try:
+                        con.execute("UPDATE games SET prefix_path=? WHERE id=?",
+                                    (_canon_pfx, new_id))
+                        con.commit()
+                        _NAGOLog.session(f"[add-game] pinned prefix path: {_canon_pfx}")
+                    except Exception as _pe:
+                        _NAGOLog.session(f"[warn] _add_game: failed to pin prefix_path for game {new_id}: {_pe}")
 
                 # Import Steam playtime immediately for Steam-type games
                 if d["game_type"] == "steam" and d.get("exe_path"):
@@ -20784,7 +24297,7 @@ class MainWindow(QMainWindow):
                     # them even when _candidates is empty.
                     _arc_match_path = ""
                     _arc_match_name = ""
-                    if _candidates:
+                    if _candidates and not _prefix_override_applied:
                         # Find the best matching archived prefix that exists on disk
 
                         # Stage 1 — exact slug match
@@ -20936,14 +24449,14 @@ class MainWindow(QMainWindow):
                         _disk_orphans = sorted(
                             [_p for _p in _pfx_root.iterdir()
                              if _p.is_dir()
-                             and _p.name.lower().startswith(_slug_new_fs + "_")
+                             and _prefix_folder_slug(_p.name).lower() == _slug_new_fs
                              and str(_p) not in _already_handled],
                             key=lambda _p: _p.stat().st_mtime,
                             reverse=True,   # most-recently-modified first
                         )
                     except OSError:
                         _disk_orphans = []
-                    if _disk_orphans:
+                    if _disk_orphans and not _prefix_override_applied:
                         _disk_old = str(_disk_orphans[0])
                         if _installed_pfx and Path(_installed_pfx).exists():
                             # Two prefixes on disk — user must pick one
@@ -21038,9 +24551,15 @@ class MainWindow(QMainWindow):
             _con2.close()
             if _row:
                 new_game = dict(zip(_cols, _row))
-                lp = self.library_page
+                # Route the in-place card insert to the grid that actually shows
+                # this entry — a tool goes to the Tools page, not the Library.
+                lp = self.tools_page if new_game.get("is_tool") else self.library_page
                 lp._all_games.append(new_game)
-                lp._game_cats[new_id] = set()
+                # Seed from the DB, not an empty set — the playtime-archive
+                # restore above may have just written this game's categories,
+                # and an empty in-memory set would hide it from those category
+                # views until the next full reload.
+                lp._game_cats[new_id] = set(db_get_game_categories(new_id))
                 card = GameCard(new_game,
                                 accent_color=self.config.get("accent_color", DEFAULT_ACCENT))
                 card.launch_requested.connect(lp._launch_game)
@@ -21060,9 +24579,28 @@ class MainWindow(QMainWindow):
                 cover = new_game.get("cover_path", "")
                 if cover and Path(cover).exists():
                     lp._refresh_single_cover(new_id, cover)
-            # Switch to library view — _show_library calls _apply_filter which
-            # reflows the grid and makes the new card visible. No rebuild needed.
-            self._show_library()
+            # Land the new entry where the user already is instead of yanking
+            # the view: a tool stays on Tools; a game added from a category
+            # view is auto-assigned that category and the view stays; a game
+            # added from the Library root (or anywhere else) shows the Library.
+            # _show_* re-applies the filter, which reflows the grid and makes
+            # the new card visible. No rebuild needed.
+            if new_id is not None and self._added_is_tool:
+                self._show_tools()
+            elif (new_id is not None
+                  and self.stack.currentWidget() is self.library_page
+                  and self._active_cat_id):
+                # MERGE with existing assignments — the playtime-archive
+                # restore may have already re-attached this game's old
+                # categories, and db_set_game_categories replaces wholesale.
+                _cats = db_get_game_categories(new_id)
+                if self._active_cat_id not in _cats:
+                    db_set_game_categories(new_id, _cats + [self._active_cat_id])
+                self.library_page._game_cats[new_id] = set(_cats) | {self._active_cat_id}
+                # page_title holds the active category's name in category view
+                self._show_category(self._active_cat_id, self.page_title.text())
+            else:
+                self._show_library()
             if _prefix_restore_msg:
                 self._set_status(_prefix_restore_msg)
             else:
@@ -21074,6 +24612,7 @@ class MainWindow(QMainWindow):
         old_theme  = self.config.get("theme", "dark")
         self.config = cfg
         self.library_page.update_config(cfg)
+        self.tools_page.update_config(cfg)
 
         width_changed  = cfg.get("card_width",   CARD_W)          != old_width
         accent_changed = cfg.get("accent_color", DEFAULT_ACCENT)  != old_accent
@@ -21092,30 +24631,65 @@ class MainWindow(QMainWindow):
         if (accent_changed or theme_changed) and not width_changed:
             # Update hover overlay accent on all existing cards without rebuilding
             new_accent = cfg.get("accent_color", DEFAULT_ACCENT)
-            for card in self.library_page._cards.values():
-                card.update_accent(new_accent)
+            for _g in (self.library_page, self.tools_page):
+                for card in _g._cards.values():
+                    card.update_accent(new_accent)
+                # Propagate accent to drop containers so indicator lines stay in sync
+                _g.container.set_accent(new_accent)
             self._apply_hidden_btn_style(new_accent)
-            # Propagate accent to drop containers so indicator lines stay in sync
-            self.library_page.container.set_accent(new_accent)
             self._cat_container.set_accent(new_accent)
 
 
-        # Apply play button visibility to all cards immediately
+        # Apply play button + rating visibility to all cards immediately
         show_play = bool(cfg.get("show_play_button", True))
-        for card in self.library_page._cards.values():
-            card.update_play_button(show_play)
+        show_rating = bool(cfg.get("show_rating", True))
+        for _g in (self.library_page, self.tools_page):
+            for card in _g._cards.values():
+                card.update_play_button(show_play)
+                card.update_show_rating(show_rating)
+            # Smooth scrolling toggle — scroller checks the flag per wheel event
+            _g._smooth.enabled = bool(cfg.get("smooth_scroll", True))
 
         if width_changed:
             # Cards must be rebuilt at the new size
             self.library_page.reload(category_id=self._active_cat_id)
+            self.tools_page.reload(category_id=None)
 
-        self._set_status("Settings saved")
+        if theme_changed:
+            # Icon colors are baked into pixmaps at construction — QSS re-applies
+            # live but persistent-widget icons keep the old theme's color until
+            # relaunch. This must be the LAST status write in this handler or a
+            # later "Settings saved" would overwrite it before it can be read.
+            self._set_status("Settings saved — restart NAGO to fully refresh icons")
+        else:
+            self._set_status("Settings saved")
 
     def _set_status(self, msg: str):
         self.status_lbl.setText(f"  {msg}")
-        QTimer.singleShot(4000, lambda: self.status_lbl.setText("  Ready"))
+        QTimer.singleShot(8000, lambda: self.status_lbl.setText("  Ready"))
 
     # ── Frameless window helpers ──────────────────────────────────────────────
+
+    def _resync_hover(self, *widgets):
+        """Force-clear stuck :hover state on the given widgets.
+
+        Qt only updates hover on mouse MOTION. Two cases deliver no Leave
+        event and leave WA_UnderMouse set: (1) programmatic geometry changes
+        — clicking maximize shifts the buttons under a stationary cursor;
+        (2) modal dialogs — input is grabbed, the mouse departs, the button
+        under the old position never hears about it. Clear-only by design:
+        no synthetic Enter (Qt6 Enter events need real QEnterEvent positions
+        — faking them is its own bug surface). If the cursor genuinely still
+        sits on the widget, the next 1px mouse move re-establishes hover.
+        """
+        from PyQt6.QtCore import QEvent as _QEvent
+        for w in widgets:
+            if w is None or not w.isVisible():
+                continue
+            w.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
+            QApplication.sendEvent(w, _QEvent(_QEvent.Type.Leave))
+            w.style().unpolish(w)
+            w.style().polish(w)
 
     def _make_win_btn(self, text: str, on_click, danger: bool = False) -> QPushButton:
         btn = QPushButton(text)
@@ -21139,24 +24713,32 @@ class MainWindow(QMainWindow):
         if event.type() == _QEvent.Type.WindowStateChange:
             maximized = self.isMaximized()
             self._max_btn.setText("❐" if maximized else "☐")
+            # Buttons just moved under a stationary cursor — clear stuck hover
+            # after Qt finishes its own state bookkeeping (same one-tick
+            # deferral as the styling below).
+            QTimer.singleShot(0, lambda: self._resync_hover(
+                self._min_btn, self._max_btn, self._close_btn, self.add_btn))
             if maximized:
                 # Remove translucency so the compositor clips to a plain rectangle,
                 # eliminating the rounded-corner ghost outline at screen edges.
+                # BG must match the active theme's __T_BG__ — resolved at
+                # maximize time, not hardcoded (light theme went dark otherwise).
+                _max_bg = _t("#1d1d20", "#f0f0f3")
                 self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-                self.setStyleSheet("""
-                    QMainWindow, QWidget#root {
-                        border-radius: 0px; background: #1d1d20; border: none;
-                    }
-                    QWidget#sidebar {
+                self.setStyleSheet(f"""
+                    QMainWindow, QWidget#root {{
+                        border-radius: 0px; background: {_max_bg}; border: none;
+                    }}
+                    QWidget#sidebar {{
                         border-top-left-radius: 0px;
                         border-bottom-left-radius: 0px;
-                    }
-                    QWidget#topbar {
+                    }}
+                    QWidget#topbar {{
                         border-top-right-radius: 0px;
-                    }
-                    QLabel#statusBar {
+                    }}
+                    QLabel#statusBar {{
                         border-bottom-right-radius: 0px;
-                    }
+                    }}
                 """)
             else:
                 # Restore translucency and rounded corners for windowed mode.
@@ -21284,10 +24866,12 @@ class _InstanceListener(threading.Thread):
                 break  # socket closed — app is shutting down
 
 
-def _acquire_instance_lock() -> "_InstanceListener | None":
+def _acquire_instance_lock() -> "tuple[_InstanceListener, _RaiseSignalEmitter, socket.socket]":
     """Try to become the first instance.
-    Returns a running _InstanceListener if we are the first instance.
-    Returns None and exits the process if another instance is already running."""
+    Returns (listener, emitter, server_socket) if we are the first instance —
+    main() keeps all three: listener runs for the app's lifetime, emitter is
+    wired to MainWindow._raise_window, srv is closed at exit.
+    Exits the process (sys.exit) if another instance is already running."""
     # Try connecting first — if it succeeds, a first instance is running.
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -21343,11 +24927,9 @@ def main():
         _exit_code = 1
     finally:
         # Scrub all exception/traceback state from the interpreter before shutdown.
-        # Python 3.14 + SIP 13.11 will SEGV if any live traceback frame holds a
-        # reference to a Qt wrapper object when QApplication is being deallocated.
-        # _run_app() already called `del win; del app` so Qt is fully shut down;
-        # wiping sys.last_* and the current exception chain ensures no stale frame
-        # survives into GC teardown.
+        # Qt is intentionally never torn down (see _run_app tail); we os._exit()
+        # below, so this scrub is belt-and-suspenders — it only matters if an
+        # exception path somehow reaches interpreter shutdown instead.
         for _attr in ("last_exc", "last_traceback", "last_value", "last_type"):
             try:
                 setattr(sys, _attr, None)
@@ -21355,10 +24937,11 @@ def main():
                 pass
         sys.excepthook = sys.__excepthook__
 
-    # os._exit() bypasses Python's GC entirely — safe here because Qt has already
-    # been torn down inside _run_app() via `del win; del app`.  This is the
-    # recommended workaround for PyQt6 + Python 3.12+ where GC dealloc order can
-    # trigger SIP use-after-free on wrapped QObjects during interpreter shutdown.
+    # os._exit() bypasses Python's GC and interpreter shutdown entirely. Qt is
+    # deliberately NEVER torn down (_run_app() returns with win/app still
+    # alive) — see the comment there: `del app` triggers SIP's crash-prone
+    # wrapper-registry walk on Py3.14 + SIP 13.11. The OS reclaims everything
+    # when the process exits.
     try:
         _srv.close()
         _INSTANCE_SOCKET.unlink()
@@ -21380,6 +24963,9 @@ def _run_app(_emitter: "_RaiseSignalEmitter") -> int:
 
     # Load the Phosphor icon font before any widgets are built
     _load_phosphor_font()
+    # Bundled Inter UI font — loaded before any widgets so QSS and the app
+    # default font resolve to it from the first paint.
+    _load_inter_font()
 
     # Apply palette (dark or light) based on saved theme preference.
     # _apply_stylesheet (called below) also calls _apply_palette, but doing it
@@ -21389,6 +24975,11 @@ def _run_app(_emitter: "_RaiseSignalEmitter") -> int:
 
     # Install NAGO's custom style proxy — draws checkboxes using Phosphor icons.
     app.setStyle(NAGOStyle("Fusion"))
+
+    # Custom rounded tooltips — replaces native QToolTip app-wide.
+    # Parented to app (QObject) so it stays alive for the app's lifetime.
+    _tooltip_filter = NAGOToolTipFilter(app)
+    app.installEventFilter(_tooltip_filter)
 
     # Load and apply stylesheet with accent color from config.
     _apply_stylesheet(app, load_config())
@@ -21406,33 +24997,30 @@ def _run_app(_emitter: "_RaiseSignalEmitter") -> int:
 
     exit_code = app.exec()
 
-    # Explicit cleanup order matters on Python 3.14+ with PyQt6/SIP.
-    # Wrap the entire teardown in try/except BaseException so that if anything
-    # raises during widget destruction (e.g. a timer callback firing into a
-    # half-deleted widget), we catch it and scrub exception state immediately —
-    # before Python's GC has a chance to walk the traceback chain and call
-    # SIP's cleanup_qobject on already-freed C++ objects.
-    try:
-        app.processEvents()          # flush pending signal deliveries / paint events
-        gc.collect()                 # collect Python-side circular refs before Qt teardown
-        del win
-        app.processEvents()          # drain events queued during widget teardown
-        del app
-    except BaseException:
-        # Scrub exception chain immediately — don't let any frame ref survive
-        import sys as _sys
-        _ex = _sys.exc_info()[1]
-        _next = None
-        while _ex is not None:
-            try:
-                _ex.__traceback__ = None
-            except Exception:
-                pass
-            _next = getattr(_ex, "__context__", None) or getattr(_ex, "__cause__", None)
-            if _next is _ex:
-                break
-            _ex = _next
-        del _ex, _next
+    # PIN app AND win IN MODULE GLOBALS — do not remove.
+    #
+    # History: `del app` SEGV'd (SIP registry walk, see below). Removing the
+    # explicit teardown (build 16:40) did NOT fix it — the 21:13 core dump
+    # shows the same SEGV from _PyEval_FrameClearAndPop: `app` is a LOCAL, so
+    # returning from this function clears the frame, drops the last reference,
+    # and deallocs QApplication anyway. Same walk, new trigger.
+    #
+    # The dealloc itself is the problem: sipWrapper_dealloc →
+    # release_QApplication → sip_api_visit_wrappers → cleanup_qobject, which
+    # SEGVs on Python 3.14 + SIP 13.11 whenever ANY wrapper in the process has
+    # gone stale (upstream SIP bug — not fixable from here; per-wrapper
+    # hand-deletion was tried 11-07-2026 and lost to whack-a-mole).
+    #
+    # So: park both objects in module globals. Refcount can never reach zero,
+    # dealloc never runs, the walk never happens. main() calls os._exit()
+    # right after we return — the OS reclaims everything; this "leak" lives
+    # for microseconds. Background workers are already stopped via the
+    # _NAGOThread registry before exec() returns, so nothing is mid-write.
+    #
+    # DELETE THIS WORKAROUND when Fedora ships python-pyqt6-sip 13.12+
+    # (check: dnf list python-pyqt6-sip).
+    global _PINNED_QT_ROOTS
+    _PINNED_QT_ROOTS = (app, win)
 
     return exit_code
 

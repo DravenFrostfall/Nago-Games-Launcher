@@ -2,7 +2,7 @@
 Name=NAGO Launcher
 Comment=Linux game launcher with SteamGridDB, Proton, and umu support
 # EDIT: replace /path/to with the actual folder where nago-launcher.py lives
-Exec=python3 /home/USER/.local/share/nago-launcher/nago-launcher.py
+Exec=python3 /home/USER/.local/share/nago-launcher/nago.py
 Icon=/home/USER/.local/share/nago-launcher/icons/nago-logo.png
 Type=Application
 Categories=Game;
